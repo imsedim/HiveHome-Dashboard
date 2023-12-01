@@ -1,3 +1,4 @@
+import asyncio
 import random
 from utils import DATE_TYPE_DAY, _this, make_utc, render_date_title, write_date_picker
 from datetime import date
@@ -5,17 +6,35 @@ import streamlit as st
 import hive
 import pandas as pd
 
-def app():
+CSS = """
+<style>
+header {visibility: hidden;}
+footer {visibility: hidden;}
+.css-1oe6wy4 {padding-top: 0rem;}
+.css-ng1t4o {padding-top: 0rem;}
+.css-18e3th9 {padding-top: 0rem;}
+.st-emotion-cache-z5fcl4 {
+    padding: 0rem 1rem 0rem 2.5rem;
+}
+.st-emotion-cache-10oheav {
+  padding-top: 0rem;
+}
+
+</style>
+"""
+
+async def app():
     st.set_page_config(page_title="Heating Dashboard",
                        layout="wide",
                        initial_sidebar_state="collapsed")
+    st.markdown(CSS, unsafe_allow_html=True)
 
     *date_cols, _, col1, col2 = st.columns((27.5, 75, 22.5, 20, 60, 420))
 
     device_data, data_is_expired = None, False
     try:
         with st.spinner('Loading data'):
-            device_data = hive.get_device_data(False)
+            device_data = await hive.get_device_data(False)
     except:
         pass
 
@@ -25,10 +44,10 @@ def app():
     interpolate = col2.checkbox("Interpolate", value=True)
 
     if refresh or (st.session_state.get("auth_state") == "complete"):
-        st.session_state["auth_state"] = None
-        if check_auth():
+        if (st.session_state.get("auth_state") == "complete") or check_auth():
+            st.session_state["auth_state"] = None
             with st.spinner('Loading data'):
-                device_data = hive.get_device_data(True)
+                device_data = await hive.get_device_data(True)
         else:
             st.session_state["auth_state"] = "pending"
 
@@ -38,13 +57,13 @@ def app():
     if device_data is None:
         st.stop()
 
-    devices = hive.get_devices()
+    devices = await hive.get_devices()
     device_id = st.selectbox("Device", [""] + [d.id for d in devices.values() if d.is_trv or d.is_heater],
                              format_func=lambda x: devices[x].name if x else "", key="device_id")
-
+    device_name = devices[device_id].name if device_id else None
     is_daily_chart = st.session_state["date_type"] == DATE_TYPE_DAY
-    device_data = prepare_data(device_data, date_from, date_to, device_id, not is_daily_chart)
-    spec = get_daily_chart_spec(device_id, interpolate) if is_daily_chart else get_agg_chart_spec(device_id)
+    device_data = prepare_data(devices, device_data, date_from, date_to, device_id, not is_daily_chart)
+    spec = get_daily_chart_spec(device_name, interpolate) if is_daily_chart else get_agg_chart_spec(device_name)
     st.vega_lite_chart(device_data, spec, use_container_width=False)
 
     with st.expander("Dataframe"):
@@ -89,8 +108,7 @@ def check_auth() -> bool:
         return False
 
 
-def prepare_data(device_data: pd.DataFrame, date_from: date, date_to: date, device_id: str | None, aggregate: bool):
-    devices = hive.get_devices()
+def prepare_data(devices: dict, device_data: pd.DataFrame, date_from: date, date_to: date, device_id: str | None, aggregate: bool):
     date_from, date_to = pd.to_datetime([date_from, date_to]).tz_localize('Europe/London')
     device_data = device_data.assign(date=lambda x: x.date.dt.tz_convert('Europe/London'))
     print(f"{date_from}({date_from.timestamp()}) / {date_to}({date_to.timestamp()})")
@@ -125,11 +143,10 @@ def prepare_data(device_data: pd.DataFrame, date_from: date, date_to: date, devi
                               heating_length_str=lambda x: heating_length_str.where(x.heating_relay, "") if "heating_relay" in x else heating_length_str)
 
 
-def get_agg_chart_spec(device_id: str | None) -> dict:
-    devices = hive.get_devices()
+def get_agg_chart_spec(device_name: str | None) -> dict:
     spec = {"height": 460,
-            "width": 1420,
-            "title": f"Temperature for {devices[device_id].name if device_id else 'all devices'} {render_date_title()} {' '.rjust(random.randint(1,10))}",
+            "width": 1300,
+            "title": f"Temperature for {device_name or 'all devices'} {render_date_title()} {' '.rjust(random.randint(1,10))}",
             "view": {"stroke": "transparent"},
             "layer": [
                 # {"layer": [{"mark": {"type": "line", "tooltip": True, "point": False, "interpolate": "monotone", "strokeWidth": 3}},
@@ -159,7 +176,7 @@ def get_agg_chart_spec(device_id: str | None) -> dict:
                          "color": {"field": "device_name", "type": "nominal", "title": ""}},
             "resolve": {"scale": {"y": "independent"}}}
 
-    if device_id:
+    if device_name:
         spec["encoding"].pop("color")
         spec["layer"][1]["encoding"]["color"] = {"value": "red"}
 
@@ -178,46 +195,49 @@ def get_agg_chart_spec(device_id: str | None) -> dict:
     return spec
 
 
-def get_daily_chart_spec(device_id: str | None, interpolate: bool) -> dict:
-    devices = hive.get_devices()
-
+def get_daily_chart_spec(device_name: str | None, interpolate: bool) -> dict:
     spec = {"height": 460,
-            "width": 1420,
-            "title": f"Temperature for {devices[device_id].name if device_id else 'all devices'} {render_date_title()} {' '.rjust(random.randint(1,10))}",
+            "width": 1300,
+            "title": f"Temperature for {device_name or 'all devices'} {render_date_title()} {' '.rjust(random.randint(1,10))}",
             "view": {"stroke": "transparent"},
             "transform": [{"window": [{"field": "temperature",
                                        "op": "mean",
                                        "as": "rolling_mean"}],
                            "frame": [-7, 7],
                            "groupby": ["device_id"]}],
-            "layer": [{"layer": [{"mark": {"type": "line", "tooltip": True, "point": False, "interpolate": "monotone", "strokeWidth": 3}}],
+
+            "layer": [{"layer": [{"mark": {"type": "line", "tooltip": True, "point": False, "interpolate": "monotone", "strokeWidth": 3},
+                                  "params": [{"name": "zoom_x", "bind": "scales", 
+                                              "select": {"type": "interval", "encodings": ["x"]}}]}],
                        "encoding": {"y": {"field": ["temperature", "rolling_mean"][interpolate], "type": "quantitative", "stack": None,
                                           "scale": {"zero": False}, "axis": {"grid": True, "title": "Temperature"}},
+                                    # "size": {"field": "heating_demand", "type": "ordinal"},
                                     "tooltip": [{"field": "date", "title": "time",  "type": "temporal", "timeUnit": "hoursminutes"},
                                                 {"field": "temperature"},
                                                 {"field": "heat_target"},
                                                 {"field": "heating_demand"},
                                                 {"field": "device_name"}]}},
-                      #    "params": [{"name": "zoom_x",
-                      #                "select": {"type": "interval", "encodings": ["x"]},
-                      #                "bind": "scales"}],
                       {"mark": {"type": "area", "interpolate": "step-after", "transparent": True, "opacity": 0.7, "tooltip": True},
                        "encoding": {"y": {"field": "heating_relay", "type": "quantitative",
                                           "scale": {"zero": False, "domain": [0, 20]}, "axis": None},
                                     "tooltip": [{"field": "heating_start", "type": "temporal", "timeUnit": "hoursminutes", "title": "start"},
-                                                {"field": "heating_length_str", "title": "length"}]
-                                    }}],
+                                                {"field": "heating_length_str", "title": "length"}]}}],
             "encoding": {"x": {"field": "date", "type": "temporal", "timeUnit": "hoursminutes", "title": "time",
                                "axis": {"ticks": True, "grid": True, "gridOpacity": 0.35}},
                          "color": {"field": "device_name", "type": "nominal", "title": ""}},
             "resolve": {"scale": {"y": "independent"}}}
 
-    if device_id:
+    if device_name:
         spec["encoding"].pop("color")
         spec["layer"][1]["encoding"]["color"] = {"value": "red"}
 
+        spec["layer"].append({"mark": {"type": "line", "strokeWidth": 0.8, "opacity": 0.7},
+                              "encoding": {"y": {"field": "heating_demand_percentage", "type": "quantitative",  "interpolate": "linear",
+                                                 "scale": {"domain": [0, 150]}, "axis": {"title": "Heating Demand %"}},
+                                           "color": {"value": "grey"}}})
+
         spec["layer"].append({"mark": {"type": "area", "interpolate": "step-after", "transparent": False, "opacity": 0.2, "tooltip": False, "color": "green"},
-                              "encoding": {"y": {"field": "heating_demand", "type": "quantitative", "scale": {"zero": False, "domain": [0, 40]}, "axis": None}}})
+                              "encoding": {"y": {"field": "heating_demand", "type": "quantitative", "scale": {"zero": False, "domain": [0, 30]}, "axis": None}}})
 
         spec["layer"][0]["layer"].append({"mark": {"type": "area", "tooltip": True, "point": False, "interpolate": "step-after", "opacity": 0.05,
                                                    "line": {"color": "#468B52", "strokeDash": [8, 8], "strokeWidth": 2, "opacity": 0.75},
@@ -227,4 +247,8 @@ def get_daily_chart_spec(device_id: str | None, interpolate: bool) -> dict:
     return spec
 
 
-app()
+async def main():
+    async with hive._init_session():
+        await app()
+
+asyncio.run(main())
