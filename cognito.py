@@ -1,7 +1,4 @@
 import base64
-import json
-from pathlib import Path
-from typing import Literal
 import pycognito
 from pycognito.exceptions import MFAChallengeException
 from pycognito.aws_srp import hash_sha256, pad_hex, get_random, hex_to_long, hex_hash, G_HEX, N_HEX, AWSSRP as srp
@@ -10,6 +7,15 @@ import os
 import platform
 
 _ = MFAChallengeException
+
+
+class BotoSession(boto3.Session):
+    cached_client: boto3.client = None
+
+    def client(self, *args, **kw):
+        if not self.cached_client:
+            self.cached_client = super().client(*args, **kw)
+        return self.cached_client
 
 
 class AWSSRP(srp):
@@ -82,15 +88,14 @@ class Cognito(pycognito.Cognito):
                       DeviceSecretVerifierConfig=device_secret_verifier_config,
                       DeviceName=platform.node())
 
-        response = boto3.client("cognito-idp", region_name=self.user_pool_region).confirm_device(**params)
+        response = self.client.confirm_device(**params)
 
         return response, device_password
 
     def update_device_status(self, remembered: bool):
-        client = boto3.client("cognito-idp", region_name=self.user_pool_region)
-        client.update_device_status(AccessToken=self.access_token,
-                                    DeviceKey=self.device_key,
-                                    DeviceRememberedStatus=["not_remembered", "remembered"][remembered])
+        self.client.update_device_status(AccessToken=self.access_token,
+                                         DeviceKey=self.device_key,
+                                         DeviceRememberedStatus=["not_remembered", "remembered"][remembered])
 
     def authenticate(self, password, client_metadata=None):
         """

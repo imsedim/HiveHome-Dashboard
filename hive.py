@@ -5,14 +5,17 @@ import hashlib
 from pathlib import Path
 from urllib.parse import urlparse
 import time
-from typing import Any, Callable
+from typing import Any
 import json
 from aiohttp import ClientResponseError, ClientSession
 from cognito import Cognito, MFAChallengeException
 import pandas as pd
 import pydantic
+import boto3
 
 SESSION: ClientSession = None
+BOTO_SESSION: boto3.Session = None
+
 DATA_DIR = Path("data")
 
 if not DATA_DIR.exists():
@@ -53,7 +56,7 @@ class Device(pydantic.BaseModel):
         return self.type == "boilermodule"
 
 
-def _init_session() -> ClientSession:
+def init_session() -> ClientSession:
     global SESSION
     SESSION = ClientSession(raise_for_status=True)
     return SESSION
@@ -73,7 +76,7 @@ def _create_cognito(username: str | None = None, id_token: str | None = None, ac
                     refresh_token: str | None = None, device_key: str | None = None, device_group_key: str | None = None) -> Cognito:
     return Cognito(user_pool_id='eu-west-1_SamNfoWtf', client_id='3rl4i0ajrmtdm8sbre54p9dvd9',
                    username=username, id_token=id_token, access_token=access_token, refresh_token=refresh_token,
-                   device_key=device_key, device_group_key=device_group_key)
+                   device_key=device_key, device_group_key=device_group_key, session=BOTO_SESSION)
 
 
 @contextmanager
@@ -83,6 +86,7 @@ def time_it(msg: str) -> Any:
         yield start
     finally:
         print(f"{msg} – {int((time.time() - start)*1000)}ms")
+
 
 def timeit(func):
     def timed(*args, **kwargs):
@@ -124,7 +128,7 @@ def complete_authentication(username: str, mfa_code: str, mfa_tokens: Any) -> Au
     assert username
     assert mfa_code
     assert mfa_tokens
-    
+
     u = _create_cognito(username=username)
     u.respond_to_sms_mfa_challenge(mfa_code, mfa_tokens)
     u.confirm_device()
@@ -183,7 +187,7 @@ async def fetch_device_data(device: str, return_full_history: bool) -> tuple[str
     history_file = Path(f"data/raw/{device}.json")
     if history_file.exists():
         old_data = json.loads(history_file.read_text())
-        start_time = pd.to_datetime(old_data["period"]["to"], unit='s', utc=True).to_pydatetime() - DATA_OVERLAP_DELTA
+        start_time = pd.to_datetime(int(old_data["period"]["to"]), unit='s', utc=True).to_pydatetime() - DATA_OVERLAP_DELTA
     else:
         old_data, start_time = None, datetime(2023, 3, 1, 0, 0, 0)
 
@@ -205,15 +209,15 @@ def merge_device_data(data: dict | None, new_data: dict) -> dict:
     for key, time_entries in new_data.items():
         if key not in ["id", "period"]:
             data.setdefault(key, {}).update(time_entries)
-            max_time_entries.append(max(time_entries.keys()))
+            if time_entries:
+                max_time_entries.append(max(time_entries.keys()))
 
-    data["period"]["to"] = max(max_time_entries)
+    data["period"]["to"] = max(max_time_entries, default=data["period"]["from"])
 
     return data
 
 
 def create_device_dataframe(devices: dict[str, Device], data: dict) -> pd.DataFrame:
-    device_names = {x.id: x.name for x in devices.values()}
     df = (pd.concat((pd.concat(pd.DataFrame(mv.items(), columns=["date", "value"]).assign(measure=m)
                                for m, mv in device_data.items()
                                if mv and m in ["heat_target", "heating_relay", "temperature", "heating_demand", "heating_demand_percentage"])
@@ -223,13 +227,19 @@ def create_device_dataframe(devices: dict[str, Device], data: dict) -> pd.DataFr
                      for device_id, device_data in data.items()), ignore_index=True)
             .pivot_table(index=["date", "device_id"], columns="measure", values="value")
             .reset_index()
+            .assign(heating_relay=lambda x: x.heating_relay if "heating_relay" in x else None,
+                    heating_demand=lambda x: x.heating_demand if "heating_demand" in x else None)
             .assign(heating_relay=lambda x: x.heating_relay.astype('boolean'),
-                    heating_demand=lambda x: x.heating_demand.astype('boolean'))
+                    heating_demand=lambda x: x.heating_demand.astype('boolean'),
+                    is_heater=lambda x: x.device_id.apply(lambda y: devices[y].is_heater).astype('boolean'))
             .pipe(lambda x: x.assign(heat_target=None) if "heat_target" not in x else x))
 
+    device_names = {x.id: x.name for x in devices.values()}
+    heater_id = _get_heater_id(devices)
     all_dates = pd.MultiIndex.from_product([df["device_id"].unique(), df["date"].unique()], names=["device_id", "date"]).to_frame(index=False)
     return (all_dates.merge(df, on=["device_id", "date"], how="left")
-            .assign(device_name=lambda x: x.device_id.map(device_names))
+            .assign(device_name=lambda x: x.device_id.map(device_names),
+                    is_heater=lambda x: x.device_id == heater_id)
             .sort_values(["date", "device_name"]))
 
 
@@ -254,9 +264,11 @@ async def get_current_device_data(devices: dict[str, Device]) -> pd.DataFrame:
                               device_name=devices[k].name,
                               temperature=v["props"]["temperature"],
                               heat_target=v["state"]["target"],
+                              is_heater=v["type"] == "heating",
                               heating_relay=(v["props"]["working"] if v["type"] == "heating" else None))
                          for k, v in product_state.items())
-            .assign(heating_relay=lambda x: x.heating_relay.astype('boolean')))
+            .assign(heating_relay=lambda x: x.heating_relay.astype('boolean'),
+                    is_heater=lambda x: x.is_heater.astype('boolean')))
 
 
 async def get_device_data(refresh: bool = False) -> pd.DataFrame:
@@ -296,7 +308,11 @@ async def get_device_data(refresh: bool = False) -> pd.DataFrame:
         new_df["temperature"] = new_df.groupby("device_id", group_keys=False)["temperature"].apply(lambda x: x.interpolate())
         new_df["temperature"] = new_df["temperature"].fillna(new_df.groupby("device_id")["temperature"].bfill())
 
-        _add_heating_stats(new_df, new_df["device_id"] == _get_heater_id(devices))
+        new_df = (pd.merge(new_df.drop(columns=["heating_relay"]),
+                        new_df.loc[new_df.is_heater, ["date", "heating_relay"]], on="date")
+                    .assign(heating_relay=lambda x: x.heating_relay.where(x.is_heater, x.heating_relay & x.heating_demand.fillna(False))))
+
+        _add_heating_stats(new_df)
 
     new_df.to_pickle("data/device_data.pickle")
     return new_df
@@ -317,14 +333,16 @@ async def call_api_async(url: str, method: str = "get", params: dict | None = No
                 return await _request()
             raise
 
-def _add_heating_stats(df: pd.DataFrame, source_mask: pd.Series = None):
-    source_mask = source_mask if source_mask is not None else slice(None)
-    heating_grouping = (df.loc[source_mask]
-                        .assign(heating_relay=lambda x: x.heating_relay.astype(bool))
-                        .assign(heating_segment=lambda x: (x.date.shift(-1) - x.date).where(x.heating_relay, None))
-                        .pipe(lambda x: x.groupby((x.heating_relay != x.heating_relay.shift()).cumsum())))
-    df.loc[source_mask, "heating_start"] = heating_grouping.date.transform('first').where(df.heating_relay, None)
-    df.loc[source_mask, "heating_length"] = heating_grouping.heating_segment.transform('sum').where(df.heating_relay, None)
+
+def _add_heating_stats(df: pd.DataFrame):
+    for _, device_group in df[["device_id"]].groupby("device_id"):
+        heating_grouping = (df.loc[device_group.index]
+                            .assign(heating_relay=lambda x: x.heating_relay.astype(bool))
+                            .assign(next_date=lambda x: x.date.shift(-1).fillna(x.date))
+                            .pipe(lambda x: x.groupby([x.date.dt.tz_convert('Europe/London').dt.floor('D'), (x.heating_relay != x.heating_relay.shift()).cumsum()])))
+        df.loc[device_group.index, "heating_start"] = heating_grouping.date.transform('first').where(df.heating_relay, None)
+        df.loc[device_group.index, "heating_end"] = heating_grouping.next_date.transform('last').where(df.heating_relay, None)
+        df.loc[device_group.index, "heating_length"] = (df["heating_end"] - df["heating_start"]).dt.total_seconds()/60 + 1
 
 
 def _get_heater_id(devices: dict[str, Device]) -> str:
