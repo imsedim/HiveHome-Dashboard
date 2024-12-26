@@ -1,9 +1,38 @@
+from contextlib import contextmanager
 from datetime import datetime, timedelta, date, timezone
+import inspect
 import time
+from typing import Any
 import streamlit as st
 
 DATE_TYPE_DAY, DATE_TYPE_MONTH, DATE_TYPE_YEAR, DATE_TYPE_WEEK = 0, 1, 2, 3
 PRIVACY_MODE: bool = False
+
+
+@contextmanager
+def time_it(msg: str) -> Any:
+    start = time.time()
+    try:
+        yield start
+    finally:
+        print(f"{msg} – {int((time.time() - start)*1000)}ms")
+
+
+def timeit(func):
+    async def timed_async(*args, **kwargs):
+        start = time.time()
+        try:
+            return await func(*args, **kwargs)
+        finally:
+            print(f"{func.__name__} – {int((time.time() - start)*1000)}ms")
+
+    def timed_sync(*args, **kwargs):
+        start = time.time()
+        try:
+            return func(*args, **kwargs)
+        finally:
+            print(f"{func.__name__} – {int((time.time() - start)*1000)}ms")
+    return timed_async if inspect.iscoroutinefunction(func) else timed_sync
 
 
 def _this(date_type: int) -> date:
@@ -31,9 +60,11 @@ def _last(date_type: str) -> date:
         return dt - timedelta(days=dt.weekday()+7)
     raise ValueError(date_type)
 
+
 def make_utc(dt: date) -> datetime:
     timestamp = time.mktime(dt.timetuple())
     return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+
 
 class Colors:
     RED = "#C06060"
@@ -97,7 +128,7 @@ def write_date_picker(columns: list | None = None) -> tuple[date, date] | None:
             st.session_state["date_picker"] = (date.replace(day=1) + timedelta(days=(31 if direction > 0 else -1))).replace(day=1)
         elif option == DATE_TYPE_WEEK:
             st.session_state["date_picker"] = date + timedelta(days=-date.weekday() + 7 * direction)
-    
+
         st.session_state["date_type"] = st.session_state.get("date_type")
 
     col1, col2, col3, *_ = columns if columns else st.columns((27.5, 75, 22.5, 500))

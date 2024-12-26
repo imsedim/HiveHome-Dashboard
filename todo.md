@@ -2,25 +2,22 @@
 - [x] Pandas gives errors on load
 - [x] Rework get_device_data() to use last actual datapoint for next batch (so, don't use last dataframe date since then measurements are skipped)
 - [x] merge_device_data updates period.to with latest measurement timestamp
-- [ ] optimise refresh speed
+- [x] fix is_heater colour to red
+- [x] optimise refresh speed
   - [x] 30% optimize authentication
-  - [ ] 30% optimize data fetch - avoid useless merge of history
-  - [ ] 30% optimize post processing - do no reprocess data older than last fetch round up to 1 day
+  - [X] 30% optimize data fetch - avoid useless merge of history
+  - [X] 30% optimize post processing - do no reprocess data older than last fetch round up to 1 day
 
 
 # Heating costs
-- [ ] Display heating lenght and heating cost per day (include standing charge)
-- [ ] Add heating cost to heating_relay patches tooltip
-- [ ] Estimate kW rate per minute of heating using ML
+- [x] Display heating lenght and heating cost per day (include standing charge)
+- [x] Estimate kW rate per minute of heating using ML
   - [x] Download dataset from Octopus
-  - [ ] Create function to calculate heating length for X days for EON
-  - [ ] Create training dataset from Octopus + EON
-    - [ ] For Octopus, include daily aggregations
-    - [ ] for fun, isolate periods where only one TRV was active and fit price per minute there
-      - [ ] for fun, figure out the cost of 'waisted boiler cycles' for undershots
-  - [ ] Fit and visualise linear function
-  - [ ] Fit something non-linear
-- [ ] Add settings page to store heating prices and kW per minute
+  - [x] Create function to calculate heating length for X days for EON
+  - [x] Create training dataset from Octopus + EON
+    - [x] For Octopus, include daily aggregations (diff rolling windows)
+    - [x] Add duration of period (hours) as a feature (since water usage depends on it)
+  - [x] Fit and visualise linear function
 
 # Tasks
 - [ ] Rethink aggregate plots - what story does this visualisation tell? 
