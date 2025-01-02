@@ -28,7 +28,7 @@ if not DATA_DIR.exists():
     DATA_DIR.mkdir()
     RAW_DEVICE_DATA_DIR.mkdir()
 
-# DATA_OVERLAP_DELTA = timedelta(minutes=15)
+START_OF_HISTORY = datetime(2023, 3, 1, 0, 0, 0, tzinfo=UTC_TZ)
 
 
 class Credentials(pydantic.BaseModel):
@@ -168,92 +168,115 @@ async def get_devices() -> dict[str, Device]:
             for x in data}
 
 
-async def fetch_device_data(device: str, start_time: datetime) -> tuple[str, dict]:
+async def fetch_device_data(device: str, start_time: datetime, end_time: datetime) -> tuple[str, dict]:
     try:
-        data = await get_measurements(device, start_time, datetime.now(UTC_TZ))
+        data = await get_measurements(device, start_time, end_time)
         return (device, data)
     except ClientResponseError as e:
         if e.status != 404:
             raise
 
 
-def merge_device_data(data: dict | None, new_data: dict) -> dict:
-    if not data:
-        return new_data
-
-    max_time_entries = []
-    for key, time_entries in new_data.items():
-        if key not in ["id", "period"]:
-            data.setdefault(key, {}).update(time_entries)
-            if time_entries:
-                max_time_entries.append(max(time_entries.keys()))
-
-    data["period"]["to"] = max(max_time_entries, default=data["period"]["from"])
-
-    return data
-
-
 def _create_device_dataframe(devices: dict[str, Device], data: dict, resample_freq: str = "5min") -> pd.DataFrame:
     def convert_measures_to_df() -> pd.DataFrame:
+        def create_measure_df(values: dict, measure: str, device_id: str) -> pd.DataFrame:
+            return (pd.DataFrame(values.items(), columns=["date", "value"])
+                    .assign(measure=measure, device_id=device_id,
+                            date=lambda x: pd.to_datetime(x.date.astype(int), unit='s', utc=True).dt.floor('T')))
+
+        heater_id = get_heater_id(devices)
+        heating_df = (create_measure_df(data[heater_id]["heating_relay"], None, None)
+                      .rename(columns={"value": "heating_relay"})
+                      .loc[:, ["date", "heating_relay"]]
+                      .set_index("date")
+                      .sort_index()
+                      .resample("1min")
+                      .ffill()
+                      .reset_index())
+
         device_mapping = {"65e0f239-21d7-4bac-a96f-96bc3520b682": "c31bc5f9-5962-4636-ba0f-c43406c2d029"}
-        return (pd.concat((pd.concat(pd.DataFrame(mv.items(), columns=["date", "value"]).assign(measure=m)
-                                     for m, mv in device_data.items()
-                                     if mv and m in MEASURE_NAMES)
-                           .assign(date=lambda x: pd.to_datetime(x.date.astype(int), unit='s', utc=True).dt.floor('T'))
-                           .assign(device_id=device_id,
-                                   value=lambda x: x.value.where((x.measure != "heating_relay") | devices[device_id].is_heater, None))
-                           for _d, device_data in data.items()
-                           for device_id in [device_mapping.get(_d, _d)]), ignore_index=True)
-                .pivot_table(index=["date", "device_id"], columns="measure", values="value")
-                .reset_index()
-                .assign(heating_relay=lambda x: x.heating_relay if "heating_relay" in x else None,
-                        heating_demand=lambda x: x.heating_demand if "heating_demand" in x else None,
+        measures_df = (pd.concat((pd.concat(create_measure_df(mv, m, device_id)
+                                            for m, mv in device_data.items()
+                                            if mv and m in MEASURE_NAMES)
+                                  for _d, device_data in data.items()
+                                  for device_id in [device_mapping.get(_d, _d)]), ignore_index=True)
+                       .pivot_table(index=["date", "device_id"], columns="measure", values="value")
+                       .reset_index())
+
+        return (measures_df
+                .drop(columns="heating_relay")
+                .merge(heating_df, on="date")
+                .assign(heating_demand=lambda x: x.heating_demand if "heating_demand" in x else None,
                         heat_target=lambda x: x.heat_target if "heat_target" in x else None)
                 .assign(heating_relay=lambda x: x.heating_relay.astype('boolean'),
                         heating_demand=lambda x: x.heating_demand.astype('boolean')))
 
-    def unify_date(df: pd.DataFrame) -> pd.DataFrame:
-        date_index = set(df["date"].unique()) | set(pd.date_range(df["date"].min().round("5min"), df["date"].max(), freq="5min"))
+    def add_time_grid(df: pd.DataFrame, freq: str = "5min") -> pd.DataFrame:
+        date_index = (df.assign(day=lambda x: df.date.dt.normalize())
+                      .groupby(["device_id", "day"])
+                      .agg(start=('date', 'min'), end=('date', 'max'))
+                      .assign(start=lambda x: x.start.where(x.start - x.start.dt.normalize() > pd.Timedelta(minutes=30), x.start.dt.normalize()),
+                              end=lambda x: x.end.where(x.end - x.start.dt.normalize() < pd.Timedelta(hours=23, minutes=30), (x.end.dt.normalize() + pd.Timedelta(hours=23, minutes=59))))
+                      .stack()
+                      .reset_index(level=2, drop=True)
+                      .to_frame("date")
+                      .reset_index()
+                      .set_index("date")
+                      .groupby(["device_id", "day"], group_keys=False)
+                      .resample(freq)
+                      .nearest()
+                      .drop(columns="day")
+                      .reset_index())
+        return df.merge(date_index, on=["device_id", "date"], how="outer")
 
-        df_index = (pd.MultiIndex.from_product([df["device_id"].unique(), date_index], names=["device_id", "date"])
-                    .to_frame(index=False))
+    def fill_gaps(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.set_index("date")
+        interpolate_measures = ["temperature", "heating_demand_percentage"]
+        df[interpolate_measures] = df.groupby("device_id")[interpolate_measures].transform(lambda x: x.interpolate(method="index").round(1))
 
-        return df_index.merge(df, on=["device_id", "date"], how="left")
+        # bug: potentially back/forward filling heating_relay for intra-day outage gaps
+        df[MEASURE_NAMES] = df.groupby(["device_id", df.index.normalize()])[MEASURE_NAMES].ffill()
+        df[MEASURE_NAMES] = df.groupby(["device_id", (df.index - pd.Timedelta(hours=1)).normalize()])[MEASURE_NAMES].transform(lambda x: x.ffill().bfill())
+
+        return df.reset_index()
 
     def add_heating_stats(df: pd.DataFrame) -> pd.DataFrame:
-        heater_map = {_id: d.is_heater for _id, d in devices.items()}
-        df = (df.assign(is_heater=lambda x: x.device_id.map(heater_map).astype('boolean'))
-                .sort_values("date"))
-        df = (pd.merge(df.drop(columns=["heating_relay"]),
-                       df.loc[df.is_heater, ["date", "heating_relay"]], on="date")
-              .assign(heating_relay=lambda x: x.heating_relay.where(x.is_heater, x.heating_relay & x.heating_demand.fillna(False))))
+        heater_id = get_heater_id(devices)
+        df = (df.assign(is_heater=lambda x: x.device_id == heater_id,
+                        heating_relay=lambda x: x.heating_relay.where(x.is_heater, x.heating_relay & x.heating_demand.fillna(False)),
+                        next_date=lambda x: x.groupby("device_id").date.shift(-1).fillna(x.date),
+                        heating_minutes=lambda x: (x.next_date - x.date).dt.total_seconds().div(60).where(x.heating_relay, None),
+                        heating_load_minutes=lambda x: x.heating_minutes.mul(x.heating_demand_percentage).div(100))
+              .drop(columns=["next_date"]))
 
-        for _, device_group in df[["device_id"]].groupby("device_id"):
-            heating_grouping = (df.loc[device_group.index]
-                                .assign(heating_relay=lambda x: x.heating_relay.astype(bool))
-                                .assign(next_date=lambda x: x.date.shift(-1).fillna(x.date))
-                                .pipe(lambda x: x.groupby([x.date.dt.tz_convert('Europe/London').dt.floor('D'), (x.heating_relay != x.heating_relay.shift()).cumsum()])))
-            df.loc[device_group.index, "heating_start"] = heating_grouping.date.transform('first').where(df.heating_relay, None)
-            heating_end = heating_grouping.next_date.transform('last').where(df.heating_relay, None)
-            df.loc[device_group.index, "heating_length"] = (heating_end - df["heating_start"]).dt.total_seconds()/60 + 1
-        return df
+        heating_groups = (df.assign(heating_relay=lambda x: x.heating_relay.astype(float))
+                          .pipe(lambda x: x.groupby(["device_id",
+                                                     x.date.dt.tz_convert('Europe/London').dt.floor('D'),
+                                                     (x.heating_relay != x.groupby("device_id").heating_relay.shift()).cumsum()])))
 
-    def fill_gaps(df) -> pd.DataFrame:
-        df = df.sort_values(["device_id", "date"])
-        df["temperature_int"] = df.groupby("device_id")["temperature"].transform(lambda x: x.interpolate())
-        df[MEASURE_NAMES] = df.groupby("device_id")[MEASURE_NAMES].ffill().bfill()
-        return df
+        return df.assign(heating_start=heating_groups.date.transform('first').where(df.heating_relay, None),
+                         heating_length=heating_groups.heating_minutes.transform('sum').where(df.heating_relay, None),
+                         heating_load_length=heating_groups.heating_load_minutes.transform('sum').where(df.heating_relay, None))
 
-    def resample(df: pd.DataFrame, freq: str = "5min") -> pd.DataFrame:
-        return (df
-                .groupby(["device_id", pd.Grouper(key="date", freq=freq, label="right", closed="right")], as_index=False)
-                .agg({x: ['last', 'median'][x == "temperature"] for x in MEASURE_NAMES + ["is_heater", "heating_start", "heating_length"]}))
+    def resample(df: pd.DataFrame, freq: str) -> pd.DataFrame:
+        if freq is None:
+            return df
+
+        aggs = {x: "last" for x in MEASURE_NAMES + ["is_heater", "heating_start", "heating_length", "heating_load_length"]}
+        aggs.update({x: "sum" for x in ["heating_minutes", "heating_load_minutes"]})
+        aggs.update({x: "median" for x in ["temperature", "heating_demand_percentage"]})
+
+        return (df.groupby(["device_id", pd.Grouper(key="date", freq=freq, label="right", closed="right")], as_index=False)
+                .agg(aggs)
+                .assign(temperature=lambda x: x.temperature.round(1),
+                        heating_demand_percentage=lambda x: x.heating_demand_percentage.round()))
 
     df = convert_measures_to_df()
-    df = unify_date(df)
+    df = add_time_grid(df)
+    df = df.sort_values(["device_id", "date"])
     df = fill_gaps(df)
     df = add_heating_stats(df)
-    df = resample(df, resample_freq) if resample_freq else df
+    df = resample(df, resample_freq)
 
     device_names = {_id: d.name for _id, d in devices.items()}
     return df.assign(device_name=lambda x: x.device_id.map(device_names))
@@ -290,44 +313,48 @@ async def get_current_device_data(devices: dict[str, Device]) -> pd.DataFrame:
 @timeit
 async def get_device_data(refresh: bool = False) -> pd.DataFrame:
     history_data: pd.DataFrame = pd.read_pickle(CACHED_DEVICE_DATA_FILE) if CACHED_DEVICE_DATA_FILE.exists() else pd.DataFrame()
-    print("get_device_data: history", history_data.shape)
     if not refresh:
         return history_data if not history_data.empty else None
 
     devices = await get_devices()
 
-    if history_data.empty:
-        cutoff_date = datetime(2023, 3, 1, 0, 0, 0, tzinfo=UTC_TZ)
-        history_data = parse_raw_device_data(devices)
+    history_data = history_data if not history_data.empty else parse_raw_device_data(devices)
 
-    if not history_data.empty:
-        cutoff_date = history_data.iloc[-1]["date"].tz_convert(LOCAL_TZ).floor('D').tz_convert('UTC').to_pydatetime()
-        history_data = history_data[history_data["date"] < cutoff_date]
+    # round down to the beginning of day to make sure heating stats are recalculated correctly for the whole day
+    cutoff_date = (history_data.iloc[-1]["date"]
+                   .tz_convert(LOCAL_TZ)
+                   .floor('D')
+                   .tz_convert('UTC')
+                   .to_pydatetime()
+                   if not history_data.empty else None)
 
+    # extra hour to fill gaps around midnight at the start of the batch
+    batch_start = (cutoff_date - timedelta(hours=1)) if not history_data.empty else START_OF_HISTORY
+    batch_end = datetime.now(UTC_TZ)
     with time_it("Requesting data"):
-        print(f"Fetching data since {cutoff_date}")
+        print(f"Fetching data since {batch_start}")
         async with asyncio.TaskGroup() as tg:
             # current_task = tg.create_task(get_current_device_data(devices))
-            devices_tasks = [tg.create_task(fetch_device_data(device_id, cutoff_date))
+            devices_tasks = [tg.create_task(fetch_device_data(device_id, batch_start, batch_end))
                              for device_id, device in devices.items()
                              if device.is_heater or device.is_trv]
 
     device_data_dict = dict([t.result() for t in devices_tasks if t.result()])
-    suffix = ["daily", "catchup"][cutoff_date < datetime.now(LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0)]
-    (RAW_DEVICE_DATA_DIR / f"{datetime.today():%Y-%m-%d} {suffix}.json").write_text(json.dumps(device_data_dict))
+
+    # substract 1 second to represent the closed end of interval
+    new_cutoff_date = batch_end.astimezone(LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(seconds=1)
+
+    # if full day's worth of data is fetched since last.
+    if history_data.empty or (new_cutoff_date > cutoff_date):
+        print(f"New data cutoff: {new_cutoff_date: %Y-%m-%d}")
+        (RAW_DEVICE_DATA_DIR / f"{new_cutoff_date:%Y-%m-%d}.json").write_text(json.dumps(device_data_dict))
 
     device_data = _create_device_dataframe(devices, device_data_dict)
-    # device_data = pd.concat([device_data, current_task.result()], ignore_index=True)
-
     if not history_data.empty:
-        device_data = pd.concat([history_data, device_data], ignore_index=True)
+        device_data = pd.concat([history_data.query("date < @cutoff_date"),
+                                 device_data.query("date >= @cutoff_date")], ignore_index=True)
 
     device_data.to_pickle(CACHED_DEVICE_DATA_FILE)
-
-# todo:
-# in app.py:
-#   resample to lower date resolution AFTER heating stats (median)
-
     return device_data
 
 
@@ -349,10 +376,19 @@ async def call_api_async(url: str, method: str = "get", params: dict | None = No
 
 def parse_raw_device_data(devices: dict[str, Device]) -> pd.DataFrame:
     files = sorted(RAW_DEVICE_DATA_DIR.glob("*.json"), key=lambda x: x.name)
-    dataframes = [_create_device_dataframe(devices, json.loads(x.read_text()))
-                  for x in files]
-    for df, next_df in zip(dataframes, dataframes[1:]):
-        df.drop(df[df["date"] >= next_df["date"].min()].index, inplace=True)
+
+    dataframes, start_from, end_with = [], None, None
+    for file in files:
+        df = _create_device_dataframe(devices, json.loads(file.read_text()))
+        shape = df.shape[0]
+
+        start_from = end_with
+        end_with = [pd.to_datetime(file.stem).tz_localize(LOCAL_TZ) + pd.Timedelta(days=1), None][file == files[-1]]
+        query = ["@start_from <= ", ""][start_from is None] + "date" + [" < @end_with", ""][end_with is None]
+
+        df = df.query(query)
+        # print(f"{file.stem}: {shape - df.shape[0]} of {shape} ignored")
+        dataframes.append(df)
 
     return pd.concat(dataframes, ignore_index=True) if dataframes else pd.DataFrame()
 
