@@ -12,6 +12,7 @@ import pandas as pd
 import pydantic
 import boto3
 from utils import time_it, timeit
+import humanize
 
 SESSION: ClientSession = None
 BOTO_SESSION: boto3.Session = None
@@ -182,7 +183,7 @@ def _create_device_dataframe(devices: dict[str, Device], data: dict, resample_fr
         def create_measure_df(values: dict, measure: str, device_id: str) -> pd.DataFrame:
             return (pd.DataFrame(values.items(), columns=["date", "value"])
                     .assign(measure=measure, device_id=device_id,
-                            date=lambda x: pd.to_datetime(x.date.astype(int), unit='s', utc=True).dt.floor('T')))
+                            date=lambda x: pd.to_datetime(x.date.astype(int), unit='s', utc=True).dt.floor('min')))
 
         heater_id = get_heater_id(devices)
         heating_df = (create_measure_df(data[heater_id]["heating_relay"], None, None)
@@ -205,7 +206,7 @@ def _create_device_dataframe(devices: dict[str, Device], data: dict, resample_fr
 
         return (measures_df
                 .drop(columns="heating_relay")
-                .merge(heating_df, on="date")
+                .merge(heating_df, on="date", how="outer")
                 .assign(heating_demand=lambda x: x.heating_demand if "heating_demand" in x else None,
                         heat_target=lambda x: x.heat_target if "heat_target" in x else None)
                 .assign(heating_relay=lambda x: x.heating_relay.astype('boolean'),
@@ -262,12 +263,14 @@ def _create_device_dataframe(devices: dict[str, Device], data: dict, resample_fr
         if freq is None:
             return df
 
-        aggs = {x: "last" for x in MEASURE_NAMES + ["is_heater", "heating_start", "heating_length", "heating_load_length"]}
-        aggs.update({x: "sum" for x in ["heating_minutes", "heating_load_minutes"]})
-        aggs.update({x: "median" for x in ["temperature", "heating_demand_percentage"]})
+        aggs = ({x: "sum" for x in ["heating_minutes", "heating_load_minutes"]} |
+                {x: "median" for x in ["temperature", "heating_demand_percentage"]})
+        copy_columns = ["heat_target", "heating_demand", "heating_relay", "is_heater", 
+                        "heating_start", "heating_length", "heating_load_length"]
 
         return (df.groupby(["device_id", pd.Grouper(key="date", freq=freq, label="right", closed="right")], as_index=False)
                 .agg(aggs)
+                .merge(df[["device_id", "date"] + copy_columns], on=["device_id", "date"])
                 .assign(temperature=lambda x: x.temperature.round(1),
                         heating_demand_percentage=lambda x: x.heating_demand_percentage.round()))
 
@@ -296,21 +299,29 @@ async def fetch_products():
     return products
 
 
-async def get_current_device_data(devices: dict[str, Device]) -> pd.DataFrame:
+# async def get_current_device_data(devices: dict[str, Device]) -> pd.DataFrame:
+#     product_state = await get_product_state()
+#     return (pd.DataFrame(dict(date=pd.to_datetime(datetime.now(UTC_TZ), utc=True).floor('min'),
+#                               device_id=k,
+#                               device_name=devices[k].name,
+#                               temperature=v["props"]["temperature"],
+#                               heat_target=v["state"]["target"],
+#                               is_heater=v["type"] == "heating",
+#                               heating_relay=(v["props"]["working"] if v["type"] == "heating" else None))
+#                          for k, v in product_state.items())
+#             .assign(heating_relay=lambda x: x.heating_relay.astype('boolean'),
+#                     is_heater=lambda x: x.is_heater.astype('boolean')))
+
+async def get_current_device_data() -> dict[str, dict]:
     product_state = await get_product_state()
-    return (pd.DataFrame(dict(date=pd.to_datetime(datetime.now(UTC_TZ), utc=True).floor('T'),
-                              device_id=k,
-                              device_name=devices[k].name,
-                              temperature=v["props"]["temperature"],
-                              heat_target=v["state"]["target"],
-                              is_heater=v["type"] == "heating",
-                              heating_relay=(v["props"]["working"] if v["type"] == "heating" else None))
-                         for k, v in product_state.items())
-            .assign(heating_relay=lambda x: x.heating_relay.astype('boolean'),
-                    is_heater=lambda x: x.is_heater.astype('boolean')))
+    # date=pd.to_datetime(datetime.now(UTC_TZ), utc=True).floor('min'),
+    return {k: {"temperature": v["props"]["temperature"],
+                "heat_target": v["state"]["target"],
+                ["heating_demand", "heating_relay"][v["type"] == "heating"]: v["props"]["working"]}
+            for k, v in product_state.items()}
 
 
-@timeit
+@ timeit
 async def get_device_data(refresh: bool = False) -> pd.DataFrame:
     history_data: pd.DataFrame = pd.read_pickle(CACHED_DEVICE_DATA_FILE) if CACHED_DEVICE_DATA_FILE.exists() else pd.DataFrame()
     if not refresh:
@@ -321,7 +332,8 @@ async def get_device_data(refresh: bool = False) -> pd.DataFrame:
     history_data = history_data if not history_data.empty else parse_raw_device_data(devices)
 
     # round down to the beginning of day to make sure heating stats are recalculated correctly for the whole day
-    cutoff_date = (history_data.iloc[-1]["date"]
+    # skip 10 rows to ignore "current device state"
+    cutoff_date = (history_data.iloc[-10]["date"]
                    .tz_convert(LOCAL_TZ)
                    .floor('D')
                    .tz_convert('UTC')
@@ -332,22 +344,31 @@ async def get_device_data(refresh: bool = False) -> pd.DataFrame:
     batch_start = (cutoff_date - timedelta(hours=1)) if not history_data.empty else START_OF_HISTORY
     batch_end = datetime.now(UTC_TZ)
     with time_it("Requesting data"):
-        print(f"Fetching data since {batch_start}")
+        print(f"Fetching data from {batch_start:%Y-%m-%d} to {batch_end:%Y-%m-%d %H:%M:%S}")
         async with asyncio.TaskGroup() as tg:
-            # current_task = tg.create_task(get_current_device_data(devices))
+            # current_task = tg.create_task(get_current_device_data())
             devices_tasks = [tg.create_task(fetch_device_data(device_id, batch_start, batch_end))
                              for device_id, device in devices.items()
                              if device.is_heater or device.is_trv]
 
     device_data_dict = dict([t.result() for t in devices_tasks if t.result()])
 
+    last_reportings = {device_id: datetime.fromtimestamp(
+        max(int(next(reversed(device_data[m]))) for m in MEASURE_NAMES if m in device_data), tz=UTC_TZ)
+        for device_id, device_data in device_data_dict.items()}
+    print("\n".join(f"  >> Last report for <{devices[device_id].name}> was {humanize.naturaltime(last_date)}"
+                    for device_id, last_date in last_reportings.items()))
+
     # substract 1 second to represent the closed end of interval
-    new_cutoff_date = batch_end.astimezone(LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(seconds=1)
+    data_end = min(last_reportings.values())
+    new_cutoff_date = data_end.astimezone(LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(seconds=1)
 
     # if full day's worth of data is fetched since last.
     if history_data.empty or (new_cutoff_date > cutoff_date):
         print(f"New data cutoff: {new_cutoff_date: %Y-%m-%d}")
         (RAW_DEVICE_DATA_DIR / f"{new_cutoff_date:%Y-%m-%d}.json").write_text(json.dumps(device_data_dict))
+
+    # update_device_data_with_current_state(last_reportings, device_data_dict, current_task.result())
 
     device_data = _create_device_dataframe(devices, device_data_dict)
     if not history_data.empty:
@@ -356,6 +377,14 @@ async def get_device_data(refresh: bool = False) -> pd.DataFrame:
 
     device_data.to_pickle(CACHED_DEVICE_DATA_FILE)
     return device_data
+
+
+def update_device_data_with_current_state(last_reportings: dict[str, datetime], data: dict, current_device_state: dict):
+    now = datetime.now(UTC_TZ)
+    for device_id, device_data in data.items():
+        if last_reportings[device_id] <= now - timedelta(minutes=1):
+            for measure, value in current_device_state.get(device_id, {}).items():
+                device_data[measure][str(int(now.timestamp()))] = int(value)
 
 
 async def call_api_async(url: str, method: str = "get", params: dict | None = None) -> dict:
