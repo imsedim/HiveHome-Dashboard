@@ -16,19 +16,25 @@ CSS = """
 <style>
 header {visibility: hidden;}
 footer {visibility: hidden;}
+.st-emotion-cache-1ibsh2c {
+    padding: 0rem 1rem 0rem 2.5rem;
+}
 .css-1oe6wy4 {padding-top: 0rem;}
 .css-ng1t4o {padding-top: 0rem;}
 .css-18e3th9 {padding-top: 0rem;}
-.st-emotion-cache-z5fcl4 {
-    padding: 0rem 1rem 0rem 2.5rem;
-}
 .st-emotion-cache-10oheav {
   padding-top: 0rem;
 }
 div.stCheckbox {margin-top: 1px; margin-bottom: -20px;}
-div.stCheckbox label span {height:18px;width:18px}
+.st-emotion-cache-109gq4a .eiemyj1:last-of-type > .e1eyve560 {
+    margin-top: 1px;
+}
+
 div[data-testid=stHorizontalBlock] > div > div > div[data-testid=stVerticalBlock] > div > div.row-widget.stRadio > label {display:none;}
 div[data-testid=stHorizontalBlock] > div > div > div[data-testid=stVerticalBlock] > div > div.row-widget.stRadio > div > label div {font-size:10pt; white-space: nowrap;}
+
+div.clearer {clear: right; line-height: 0; height: 0;}
+
 
 </style>
 """
@@ -61,7 +67,7 @@ async def get_data(period: tuple, refresh: bool = False) -> pd.DataFrame:
         cache[None] = data
 
     date_from, date_to = pd.to_datetime(period).tz_localize('Europe/London')
-    data = data.query("@date_from <= date < @date_to")
+    data = data.query("@date_from <= date <= @date_to")
     cache[period] = data
     return data
 
@@ -292,8 +298,8 @@ def get_daily_chart_spec(device_names: list[str], device: hive.Device | None, in
                                     "tooltip": [{"field": "heating_start", "type": "temporal", "timeUnit": "hoursminutes", "title": "start"},
                                                 {"field": "heating_length_str", "title": "length"}],
                                     "color": {"value": "red"}}}],
-            "encoding": {"x": {"field": "date", "type": "temporal", "timeUnit": "hoursminutes", "title": "time",
-                               "axis": {"ticks": True, "grid": True, "gridOpacity": 0.35}},
+            "encoding": {"x": {"field": "date", "type": "temporal", "binned": True,  "title": "time",
+                               "axis": {"ticks": True, "grid": True, "gridOpacity": 0.35, "format": "%H:%M"}},
                          "detail": {"field": "device_name", "type": "nominal", "title": ""}},
             "resolve": {"scale": {"y": "independent"}}}
 
