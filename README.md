@@ -62,7 +62,4 @@ print(df.head())
 
 
 ### Caveats
-* Authentication only lasts 1 hour and then expires and has to be done again.\
-Theoretically, it's possible to use "refresh tokens" like the native hive app does, but I could not manage to make it work. 
-
-* My dataframe post-processing has some bugs so not all heating windows are calculated. 
+* you will need to change the start date from 2023 to a nearer date - HIVE endpoints timeout when loading too much data
