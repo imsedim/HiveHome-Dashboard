@@ -233,7 +233,7 @@ def _create_device_dataframe(devices: dict[str, Device], data: dict, resample_fr
     def fill_gaps(df: pd.DataFrame) -> pd.DataFrame:
         df = df.set_index("date")
         interpolate_measures = ["temperature", "heating_demand_percentage"]
-        df[interpolate_measures] = df.groupby("device_id")[interpolate_measures].transform(lambda x: x.interpolate(method="index").round(1))
+        df[interpolate_measures] = df.groupby("device_id")[interpolate_measures].transform(lambda x: x.interpolate(method="quadratic").round(5))
 
         # bug: potentially back/forward filling heating_relay for intra-day outage gaps
         df[MEASURE_NAMES] = df.groupby(["device_id", df.index.normalize()])[MEASURE_NAMES].ffill()
@@ -259,19 +259,28 @@ def _create_device_dataframe(devices: dict[str, Device], data: dict, resample_fr
                          heating_length=heating_groups.heating_minutes.transform('sum').where(df.heating_relay, None),
                          heating_load_length=heating_groups.heating_load_minutes.transform('sum').where(df.heating_relay, None))
 
-    def resample(df: pd.DataFrame, freq: str) -> pd.DataFrame:
+    def resample(df: pd.DataFrame, freq: str = "5min"):
         if freq is None:
             return df
 
-        aggs = ({x: "sum" for x in ["heating_minutes", "heating_load_minutes"]} |
-                {x: "median" for x in ["temperature", "heating_demand_percentage"]})
-        copy_columns = ["heat_target", "heating_demand", "heating_relay", "is_heater", 
-                        "heating_start", "heating_length", "heating_load_length"]
+        aggs = ({x: (x, "sum") for x in ["heating_minutes", "heating_load_minutes"]} |
+                {"t_low": (["temperature", "t_low"]["t_low" in df], "min"), 
+                "t_high": (["temperature", "t_high"]["t_high" in df], "max")})
+        copy_columns = ["heat_target", "heating_demand", "heating_relay", "is_heater",
+                        "heating_start", "heating_length", "heating_load_length", 
+                        "temperature", "heating_demand_percentage"]
+
+        # heating_relay looks into the future, so is heating_minutes derived from it
+        # bug: heating_minutes after resampling look both in future and past - need to rethink label and closed
+        # problems: 
+        # - mismatch between heating_length and sum(heating_minutes) - 23/10 Living room (also 24/10 Living room, 23/10 Bedroom)
+        #   - can change frequency to 1 min (bad idea as this would fuck up temperature smoothing)
+        # - potential problems with calculation of sum(heating) for day / week / month
 
         return (df.groupby(["device_id", pd.Grouper(key="date", freq=freq, label="right", closed="right")], as_index=False)
-                .agg(aggs)
+                .agg(**aggs)
                 .merge(df[["device_id", "date"] + copy_columns], on=["device_id", "date"])
-                .assign(temperature=lambda x: x.temperature.round(1),
+                .assign(temperature=lambda x: x.temperature.round(2),
                         heating_demand_percentage=lambda x: x.heating_demand_percentage.round()))
 
     df = convert_measures_to_df()
@@ -353,8 +362,7 @@ async def get_device_data(refresh: bool = False) -> pd.DataFrame:
 
     device_data_dict = dict([t.result() for t in devices_tasks if t.result()])
 
-    last_reportings = {device_id: datetime.fromtimestamp(
-        max(int(next(reversed(device_data[m]))) for m in MEASURE_NAMES if m in device_data), tz=UTC_TZ)
+    last_reportings = {device_id: datetime.fromtimestamp(max(int(next(reversed(device_data[m]))) for m in MEASURE_NAMES if m in device_data), tz=UTC_TZ)
         for device_id, device_data in device_data_dict.items()}
     print("\n".join(f"  >> Last report for <{devices[device_id].name}> was {humanize.naturaltime(last_date)}"
                     for device_id, last_date in last_reportings.items()))
@@ -404,20 +412,22 @@ async def call_api_async(url: str, method: str = "get", params: dict | None = No
 
 
 def parse_raw_device_data(devices: dict[str, Device]) -> pd.DataFrame:
+    print("Parsing raw device data ", end="")
     files = sorted(RAW_DEVICE_DATA_DIR.glob("*.json"), key=lambda x: x.name)
 
     dataframes, start_from, end_with = [], None, None
     for file in files:
+        print(".", end="")
         df = _create_device_dataframe(devices, json.loads(file.read_text()))
-        shape = df.shape[0]
 
         start_from = end_with
         end_with = [pd.to_datetime(file.stem).tz_localize(LOCAL_TZ) + pd.Timedelta(days=1), None][file == files[-1]]
         query = ["@start_from <= ", ""][start_from is None] + "date" + [" < @end_with", ""][end_with is None]
 
         df = df.query(query)
-        # print(f"{file.stem}: {shape - df.shape[0]} of {shape} ignored")
         dataframes.append(df)
+
+    print()
 
     return pd.concat(dataframes, ignore_index=True) if dataframes else pd.DataFrame()
 

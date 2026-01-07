@@ -22,6 +22,7 @@
 # Tasks
 - [ ] Rethink aggregate plots - what story does this visualisation tell? 
   - [ ] ??? For month / year / week - add granularity controls (by week/month)
+- [x] high-level stats: % or Hours each TRV was active - vertical bar plot? 
 - [x] Highlight segments of device line where heating was demanded / received
 - [x] Make daily plot always show all devices (would be transparent if not selected)
     - [x] Revert target temperature color to what it was (greenish)

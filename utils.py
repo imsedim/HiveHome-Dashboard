@@ -135,7 +135,7 @@ def write_date_picker(columns: list | None = None) -> tuple[date, date] | None:
     date = st.session_state.get("date_picker") or _this(DATE_TYPE_DAY)
     with col2:
         option = st.radio("Period", [DATE_TYPE_DAY, DATE_TYPE_WEEK, DATE_TYPE_MONTH, DATE_TYPE_YEAR],
-                          format_func=render_date_title, key="date_type", on_change=change_date_type)
+                          format_func=render_date_title, key="date_type", on_change=change_date_type, label_visibility="collapsed")
 
     with col1:
         write_span("&nbsp;", outer_div=True, div_style="margin-top:-5px")

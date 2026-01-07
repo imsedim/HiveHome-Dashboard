@@ -2,7 +2,7 @@ import asyncio
 from decimal import Decimal
 import random
 from cognito import BotoSession
-from utils import DATE_TYPE_DAY, render_date_title, timeit, write_date_picker
+from utils import DATE_TYPE_DAY, render_date_title, timeit, write_date_picker, write_span
 from datetime import date
 import streamlit as st
 import hive
@@ -64,6 +64,17 @@ async def get_data(period: tuple, refresh: bool = False) -> pd.DataFrame:
             return None
         data["date"] = data["date"].dt.tz_convert('Europe/London')
         data["trv_heating_relay"] = data.heating_relay & ~data.is_heater
+        
+        heating_duration_str = ((heating_duration_mm := data.heating_length.dropna().astype(int)) % 60).astype(str) + "m"
+        data = data.assign(heating_length_str=lambda x:
+                                     heating_duration_str
+                                     .where(heating_duration_mm < 60, (heating_duration_mm // 60).astype(str) + "h " + heating_duration_str)
+                                     .where(x.heating_relay, ""))
+   
+        # workaround for empty tooltips in heating relay chart
+        data[["heating_start", "heating_length_str"]] = data.groupby("device_id")[["heating_start", "heating_length_str"]].ffill(1)
+        data.drop(columns=["heating_load_minutes", "heating_load_length"], inplace=True)
+        print(data.columns)
         cache[None] = data
 
     date_from, date_to = pd.to_datetime(period).tz_localize('Europe/London')
@@ -85,7 +96,7 @@ def _calculate_price(heating_length: Decimal, days: int = 0,
 async def app():
     st.markdown(CSS, unsafe_allow_html=True)
 
-    *date_cols, _, col1, col2, _, col3 = st.columns((27.5, 75, 22.5, 20, 60, 80, 40, 300))
+    *date_cols, _, col1, col2, _, col3, col4 = st.columns((27.5, 75, 22.5, 20, 60, 80, 40, 100, 200))
 
     period = write_date_picker(date_cols)
     device_data = await get_data(period)
@@ -121,12 +132,17 @@ async def app():
     device_data = prepare_data(devices, device_data, device_id, not is_daily_chart)
 
     heating_duration = get_heating_duration(is_daily_chart, device_id, devices, device_data)
-    heating_hours, heating_minutes = int(heating_duration) // 60, int(heating_duration) % 60
-    heating_duration_str = (f"{heating_hours}h" if heating_hours else "") + (f" {heating_minutes}m" if heating_minutes else "")
+    heating_duration_hh, heating_duration_mm = int(heating_duration) // 60, int(heating_duration) % 60
+    heating_duration_str = (f"{heating_duration_hh}h" if heating_duration_hh else "") + (f" {heating_duration_mm}m" if heating_duration_mm else "")
 
     col3.metric(f"{device.name if device else 'Total'} heating", heating_duration_str, delta=f"£{_calculate_price(heating_duration/60):.2f}", delta_color="inverse")
 
-    spec = get_daily_chart_spec([d.name for _, d in devices.items()], device, interpolate, display_demand_percentage, demand_overlay) if is_daily_chart else get_agg_chart_spec(device)
+    with col4:
+        write_span(render_heating_hist(device_data, get_device_colours(devices)),
+                   style="font-family: monospace;white-space: pre;",
+                   outer_div=True, div_style="font-size: 12px;line-height: normal;margin-top: 10px;")
+
+    spec = get_daily_chart_spec(get_device_colours(devices), device, interpolate, display_demand_percentage, demand_overlay) if is_daily_chart else get_agg_chart_spec(device)
     st.vega_lite_chart(device_data, spec, use_container_width=False)
 
     with st.expander("Dataframe"):
@@ -185,28 +201,24 @@ def prepare_data(devices: dict, device_data: pd.DataFrame, device_id: str | None
     if aggregate:
         device_data = (device_data.pipe(lambda x: x.query("device_id == @device_id") if device_id else x)
                        .assign(date=lambda x: x.date.dt.floor('d'))
-                       .groupby(["device_id", "device_name", "date"])
-                       .agg(low=('temperature', 'min'), high=('temperature', 'max'),
-                            open=('temperature', 'first'), close=('temperature', 'last'))
-                       .assign(heating_length=(device_data.drop_duplicates(subset=["device_id", "heating_start"])
-                                               .assign(date=lambda x: x.heating_start.dt.tz_convert('Europe/London').dt.floor('d'))
-                                               .groupby(["device_id", "device_name", "date"])
-                                               .heating_length.sum()))
-                       .assign(heating_length=lambda x: x.heating_length.fillna(0))
+                       .groupby(["device_id", "device_name", "date", "is_heater"], as_index=False)
+                       .agg(low=('temperature', 'min'), high=('temperature', 'max'), heating_length=('heating_minutes', 'sum'))
+                       .pipe(lambda xdf: xdf.merge(xdf.query("~is_heater")
+                                                   .groupby("date", as_index=False)[["heating_length"]]
+                                                   .sum()
+                                                   .rename(columns={"heating_length": "heating_daily"}), on="date"))
+                       .assign(trv_heating_share=lambda x: x.heating_length.div(x.heating_daily).where((x.heating_length > 0) & ~x.is_heater, 0).round(2))
+                       .assign(trv_heating_share = lambda x: x.heating_length.where(~x.is_heater, x.heating_length - x.heating_daily ).clip(0))
                        .assign(heating_relay=lambda x: x.heating_length > 0)
                        .reset_index())
 
-    heating_minutes_str = ((heating_minutes := device_data.heating_length.dropna().astype(int)) % 60).astype(str) + "m"
-    device_data = device_data.assign(heating_length_str=lambda x:
-                                     heating_minutes_str
-                                     .where(heating_minutes < 60, (heating_minutes // 60).astype(str) + "h " + heating_minutes_str)
-                                     .where(x.heating_relay, ""))
     return device_data
 
 
 def get_heating_duration(is_daily_chart: bool, device_id: str | None, devices: dict[str, hive.Device], device_data: pd.DataFrame) -> str:
     heating_source = device_id or hive.get_heater_id(devices)
-    heating_duration = (device_data[device_data.device_id == heating_source]
+    heating_data = device_data[device_data.device_id == heating_source]
+    heating_duration = (heating_data
                         .pipe(lambda x: x.drop_duplicates(subset=["heating_start", "heating_length"]) if is_daily_chart else x)
                         .heating_length.sum())
 
@@ -216,7 +228,7 @@ def get_heating_duration(is_daily_chart: bool, device_id: str | None, devices: d
 def get_agg_chart_spec(device: hive.Device | None) -> dict:
     spec = {"height": 460,
             "width": 1300,
-            "title": f"Temperature for {device.name if device else 'all devices'} {render_date_title()} {' '.rjust(random.randint(1,10))}",
+            "title": f"Temperature for {device.name if device else 'all devices'} {render_date_title()} {' '.rjust(random.randint(1, 10))}",
             "view": {"stroke": "transparent"},
             "layer": [
                 # {"layer": [{"mark": {"type": "line", "tooltip": True, "point": False, "interpolate": "monotone", "strokeWidth": 3}},
@@ -265,15 +277,11 @@ def get_agg_chart_spec(device: hive.Device | None) -> dict:
     return spec
 
 
-def get_daily_chart_spec(device_names: list[str], device: hive.Device | None, interpolate: bool, display_demand_percentage: bool, demand_overlay: bool) -> dict:
-    device_names = sorted(device_names)
-    # blue80 blue40 red80 red40 blueGreen80 green40 orange80 orange50 purple80 gray40
-    # 84c9ff #0068c9 #ff2b2b #ffabab #29b09d #7defa1 #ff8700 #ffd16a #6d3fc0 #d5dae5
-    colours = ["#84c9ff", "#0068c9", "#6d3fc0", "#ffd16a", "#ff2b2b", "#ffabab",  "#ff8700", "#29b09d", "#7defa1", "#ffd16a", "#6d3fc0", "#d5dae5", "#ff8700"]
-#
+def get_daily_chart_spec(device_colours: dict[str, str], device: hive.Device | None, interpolate: bool, display_demand_percentage: bool, demand_overlay: bool) -> dict:
+    device_names, colours = list(device_colours.keys()), list(device_colours.values())
     spec = {"height": 460,
             "width": 1300,
-            "title": f"Temperature for {device.name if device else 'all devices'} {render_date_title()} {' '.rjust(random.randint(1,10))}",
+            "title": f"Temperature for {device.name if device else 'all devices'} {render_date_title()} {' '.rjust(random.randint(1, 10))}",
             "view": {"stroke": "transparent"},
             "transform": [{"window": [{"field": "temperature",
                                        "op": "mean",
@@ -330,6 +338,41 @@ def get_daily_chart_spec(device_names: list[str], device: hive.Device | None, in
                                              "encoding": {"color": {"field": "device_name"},
                                                           "size": {"condition": {"test": "datum['trv_heating_relay']", "value": 14}, "value": 1}}})
     return spec
+
+
+def get_device_colours(devices: dict[str, hive.Device], include_heater: bool = True) -> dict[str, str]:
+    device_names = sorted(d.name for d in devices.values() if (d.is_heater and include_heater) or d.is_trv)
+    # blue80 blue40 red80 red40 blueGreen80 green40 orange80 orange50 purple80 gray40
+    # 84c9ff #0068c9 #ff2b2b #ffabab #29b09d #7defa1 #ff8700 #ffd16a #6d3fc0 #d5dae5
+    colours = ["#84c9ff", "#0068c9", "#6d3fc0", "#ffd16a", "#ff2b2b", "#ffabab",  "#ff8700", "#29b09d", "#7defa1", "#ffd16a", "#6d3fc0", "#d5dae5", "#ff8700"]
+
+    return dict(zip(device_names, colours))
+
+
+def render_heating_hist(df: pd.DataFrame, device_colours: dict[str, str]) -> str:
+    if df.empty:
+        return ""
+
+    heating_shares = (df.query("~is_heater")
+                      .groupby("device_name")["heating_minutes"]
+                      .sum()
+                      .pipe(lambda s: (s.mul(100) / total).round().astype(int) if (total := s.sum()) > 0 else s)
+                      .sort_values(ascending=False)
+                      .to_dict())
+
+    ticks = "┌" + "└".rjust(len(heating_shares)-1, '┼')
+
+    max_device_name = max(len(d) for d in heating_shares)
+
+    hist = ""
+    for i, device_name in enumerate(heating_shares):
+        share, colour = heating_shares[device_name], device_colours[device_name]
+        hist += f'<span style="color:{colour}">{device_name.rjust(max_device_name, ' ')}</span>'
+        hist += f' {ticks[i]} '
+        hist += f'<span style="color:{colour}">{''.rjust(share//10, '●') + ['', '◐'][share % 10 > 4] + ['', '○'][share <= 4]} {share}%</span>'
+        hist += "\n"
+
+    return hist
 
 
 @st.cache_resource

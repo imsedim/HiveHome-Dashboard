@@ -1,9 +1,9 @@
 pycognito==2023.5.0
-requests==2.31.0
-streamlit==1.41.0
-pydantic==2.4.2
+requests==2.32.3
+streamlit==1.42.0
+pydantic==2.12.5
 pandas==2.2.3
 humanize
-
-asyncio
-aiohttp
+asyncio==3.4.3
+aiohttp==3.11.12
+scipy==1.16.3
