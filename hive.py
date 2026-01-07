@@ -1,7 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-import hashlib
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any
@@ -63,6 +62,8 @@ class Device(pydantic.BaseModel):
 
 
 def init_session() -> ClientSession:
+    """Initialize global aiohttp session. Mutates SESSION global."""
+    
     global SESSION
     SESSION = ClientSession(raise_for_status=True)
     return SESSION
@@ -87,6 +88,8 @@ def _create_cognito(username: str | None = None, id_token: str | None = None, ac
 
 @timeit
 def start_authentication(username: str, password: str) -> AuthenticationResult:
+    """Begin Cognito auth flow. Returns partial result with mfa_tokens if SMS MFA required."""
+
     assert username
     assert password
 
@@ -103,6 +106,8 @@ def start_authentication(username: str, password: str) -> AuthenticationResult:
 
 @timeit
 def verify_authentication(tokens: AuthenticationResult) -> AuthenticationResult:
+    """Verify and refresh tokens if expired. May update id_token and access_token."""
+
     u = _create_cognito(id_token=tokens.id_token, access_token=tokens.access_token, refresh_token=tokens.refresh_token,
                         device_key=tokens.device_key, device_group_key=tokens.device_group_key)
     u.check_token()
@@ -112,6 +117,8 @@ def verify_authentication(tokens: AuthenticationResult) -> AuthenticationResult:
 
 @timeit
 def complete_authentication(username: str, mfa_code: str, mfa_tokens: Any) -> AuthenticationResult:
+    """Complete MFA flow. Registers device with Cognito for future remembered sessions."""
+
     assert username
     assert mfa_code
     assert mfa_tokens
@@ -125,6 +132,8 @@ def complete_authentication(username: str, mfa_code: str, mfa_tokens: Any) -> Au
 
 
 def authenticate(credentials: Credentials) -> AuthenticationResult:
+    """Authenticate or refresh session. Writes tokens to cache file; deletes cache on failure."""
+
     tokens = load_cached_tokens()
 
     try:
@@ -133,8 +142,9 @@ def authenticate(credentials: Credentials) -> AuthenticationResult:
                   complete_authentication(tokens.mfa_username, credentials.mfa_code, tokens.mfa_tokens))
 
         CACHED_TOKENS_FILE.write_text(tokens.model_dump_json())
-    except Exception:
-        (CACHED_TOKENS_FILE.unlink() if CACHED_TOKENS_FILE.exists() else None)
+    except:
+        if CACHED_TOKENS_FILE.exists():
+            CACHED_TOKENS_FILE.unlink()
         raise
 
     return tokens
@@ -146,17 +156,15 @@ def get_auth_token() -> str:
     return tokens.id_token
 
 
-def md5_hash(input: str) -> str:
-    return hashlib.md5(input.encode()).hexdigest()
-
-
-async def get_measurements(device: str, start: datetime, end: datetime) -> tuple[str, dict | None]:
+async def get_measurements(device: str, start: datetime, end: datetime) -> dict:
     params = {"from": int(start.timestamp()),
               "to": int(end.timestamp())}
     return await call_api_async(f"https://measurements.tsdb.prod.bgchprod.info/device/{device}", params=params)
 
 
 async def get_devices() -> dict[str, Device]:
+    """Fetch device list. Caches to devices.json permanently (delete file to refresh)."""
+
     file = DATA_DIR / "devices.json"
 
     if file.exists():
@@ -169,7 +177,9 @@ async def get_devices() -> dict[str, Device]:
             for x in data}
 
 
-async def fetch_device_data(device: str, start_time: datetime, end_time: datetime) -> tuple[str, dict]:
+async def fetch_device_data(device: str, start_time: datetime, end_time: datetime) -> tuple[str, dict] | None:
+    """Fetch measurements for device. Returns None silently on 404 (device has no data)."""
+
     try:
         data = await get_measurements(device, start_time, end_time)
         return (device, data)
@@ -179,6 +189,12 @@ async def fetch_device_data(device: str, start_time: datetime, end_time: datetim
 
 
 def _create_device_dataframe(devices: dict[str, Device], data: dict, resample_freq: str = "5min") -> pd.DataFrame:
+    """
+    Transform raw API measurements into processed DataFrame.
+    Applies time grid alignment, gap interpolation, and heating stats calculation.
+    Uses hardcoded device_mapping for legacy device ID remapping.
+    """
+
     def convert_measures_to_df() -> pd.DataFrame:
         def create_measure_df(values: dict, measure: str, device_id: str) -> pd.DataFrame:
             return (pd.DataFrame(values.items(), columns=["date", "value"])
@@ -295,6 +311,8 @@ def _create_device_dataframe(devices: dict[str, Device], data: dict, resample_fr
 
 
 async def get_product_state() -> dict[str, dict]:
+    """Fetch live state of devices, keyed by device ID (not product ID)."""
+
     products = await fetch_products()
     result = {x["props"]["trvs"][0]: x for x in products if x["type"] == "trvcontrol"}
     heating = next(x for x in products if x["type"] == "heating")
@@ -303,6 +321,7 @@ async def get_product_state() -> dict[str, dict]:
 
 
 async def fetch_products():
+    """Fetch products from API. Always writes to products.json (for debugging)."""
     products = await call_api_async("https://beekeeper.hivehome.com/1.0/products")
     Path("data/products.json").write_text(json.dumps(products, indent=2))
     return products
@@ -330,8 +349,14 @@ async def get_current_device_data() -> dict[str, dict]:
             for k, v in product_state.items()}
 
 
-@ timeit
+@timeit
 async def get_device_data(refresh: bool = False) -> pd.DataFrame:
+    """
+    Main entry point for device data. Returns cached DataFrame or fetches fresh data.
+    On refresh: fetches from API, archives raw JSON to data/raw/, caches processed pickle.
+    Incrementally fetches only data newer than last full day in cache.
+    """
+
     history_data: pd.DataFrame = pd.read_pickle(CACHED_DEVICE_DATA_FILE) if CACHED_DEVICE_DATA_FILE.exists() else pd.DataFrame()
     if not refresh:
         return history_data if not history_data.empty else None
@@ -396,6 +421,8 @@ def update_device_data_with_current_state(last_reportings: dict[str, datetime], 
 
 
 async def call_api_async(url: str, method: str = "get", params: dict | None = None) -> dict:
+    """Make authenticated API request. Auto-retries once on 401 after re-authenticating."""
+
     async def _request():
         session = SESSION or init_session()
         async with session.request(method, url, params=params, headers={"Authorization": get_auth_token()}) as r:
@@ -412,6 +439,8 @@ async def call_api_async(url: str, method: str = "get", params: dict | None = No
 
 
 def parse_raw_device_data(devices: dict[str, Device]) -> pd.DataFrame:
+    """Rebuild DataFrame from archived raw JSON files in data/raw/. Used for cache recovery."""
+
     print("Parsing raw device data ", end="")
     files = sorted(RAW_DEVICE_DATA_DIR.glob("*.json"), key=lambda x: x.name)
 
