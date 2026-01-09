@@ -187,6 +187,46 @@ async def fetch_device_data(device: str, start_time: datetime, end_time: datetim
         if e.status != 404:
             raise
 
+def add_heating_stats(df: pd.DataFrame, heater_id: str) -> pd.DataFrame:
+    df = (df.assign(is_heater=lambda x: x.device_id == heater_id,
+                    heating_relay=lambda x: x.heating_relay.where(x.is_heater, x.heating_relay & x.heating_demand.fillna(False)),
+                    next_date=lambda x: x.groupby("device_id").date.shift(-1).fillna(x.date),
+                    heating_minutes=lambda x: (x.next_date - x.date).dt.total_seconds().div(60).where(x.heating_relay, None),
+                    heating_load_minutes=lambda x: x.heating_minutes.mul(x.heating_demand_percentage).div(100))
+            .drop(columns=["next_date"]))
+
+    heating_groups = (df.assign(heating_relay=lambda x: x.heating_relay.astype(float))
+                        .pipe(lambda x: x.groupby(["device_id",
+                                                    x.date.dt.tz_convert('Europe/London').dt.floor('D'),
+                                                    (x.heating_relay != x.groupby("device_id").heating_relay.shift()).cumsum()])))
+
+    return df.assign(heating_start=heating_groups.date.transform('first').where(df.heating_relay, None),
+                        heating_length=heating_groups.heating_minutes.transform('sum').where(df.heating_relay, None),
+                        heating_load_length=heating_groups.heating_load_minutes.transform('sum').where(df.heating_relay, None))
+
+def resample_heating_data(df: pd.DataFrame, freq: str = "5min"):
+    if freq is None:
+        return df
+
+    aggs = ({x: (x, "sum") for x in ["heating_minutes", "heating_load_minutes"]} |
+            {"t_low": (["temperature", "t_low"]["t_low" in df], "min"), 
+            "t_high": (["temperature", "t_high"]["t_high" in df], "max")})
+    copy_columns = ["heat_target", "heating_demand", "heating_relay", "is_heater",
+                    "heating_start", "heating_length", "heating_load_length", 
+                    "temperature", "heating_demand_percentage"]
+
+    # heating_relay looks into the future, so is heating_minutes derived from it
+    # bug: heating_minutes after resampling look both in future and past - need to rethink label and closed
+    # problems: 
+    # - mismatch between heating_length and sum(heating_minutes) - 23/10 Living room (also 24/10 Living room, 23/10 Bedroom)
+    #   - can change frequency to 1 min (bad idea as this would fuck up temperature smoothing)
+    # - potential problems with calculation of sum(heating) for day / week / month
+
+    return (df.groupby(["device_id", pd.Grouper(key="date", freq=freq, label="right", closed="right")], as_index=False)
+            .agg(**aggs)
+            .merge(df[["device_id", "date"] + copy_columns], on=["device_id", "date"])
+            .assign(temperature=lambda x: x.temperature.round(2),
+                    heating_demand_percentage=lambda x: x.heating_demand_percentage.round()))
 
 def _create_device_dataframe(devices: dict[str, Device], data: dict, resample_freq: str = "5min") -> pd.DataFrame:
     """
@@ -257,54 +297,12 @@ def _create_device_dataframe(devices: dict[str, Device], data: dict, resample_fr
 
         return df.reset_index()
 
-    def add_heating_stats(df: pd.DataFrame) -> pd.DataFrame:
-        heater_id = get_heater_id(devices)
-        df = (df.assign(is_heater=lambda x: x.device_id == heater_id,
-                        heating_relay=lambda x: x.heating_relay.where(x.is_heater, x.heating_relay & x.heating_demand.fillna(False)),
-                        next_date=lambda x: x.groupby("device_id").date.shift(-1).fillna(x.date),
-                        heating_minutes=lambda x: (x.next_date - x.date).dt.total_seconds().div(60).where(x.heating_relay, None),
-                        heating_load_minutes=lambda x: x.heating_minutes.mul(x.heating_demand_percentage).div(100))
-              .drop(columns=["next_date"]))
-
-        heating_groups = (df.assign(heating_relay=lambda x: x.heating_relay.astype(float))
-                          .pipe(lambda x: x.groupby(["device_id",
-                                                     x.date.dt.tz_convert('Europe/London').dt.floor('D'),
-                                                     (x.heating_relay != x.groupby("device_id").heating_relay.shift()).cumsum()])))
-
-        return df.assign(heating_start=heating_groups.date.transform('first').where(df.heating_relay, None),
-                         heating_length=heating_groups.heating_minutes.transform('sum').where(df.heating_relay, None),
-                         heating_load_length=heating_groups.heating_load_minutes.transform('sum').where(df.heating_relay, None))
-
-    def resample(df: pd.DataFrame, freq: str = "5min"):
-        if freq is None:
-            return df
-
-        aggs = ({x: (x, "sum") for x in ["heating_minutes", "heating_load_minutes"]} |
-                {"t_low": (["temperature", "t_low"]["t_low" in df], "min"), 
-                "t_high": (["temperature", "t_high"]["t_high" in df], "max")})
-        copy_columns = ["heat_target", "heating_demand", "heating_relay", "is_heater",
-                        "heating_start", "heating_length", "heating_load_length", 
-                        "temperature", "heating_demand_percentage"]
-
-        # heating_relay looks into the future, so is heating_minutes derived from it
-        # bug: heating_minutes after resampling look both in future and past - need to rethink label and closed
-        # problems: 
-        # - mismatch between heating_length and sum(heating_minutes) - 23/10 Living room (also 24/10 Living room, 23/10 Bedroom)
-        #   - can change frequency to 1 min (bad idea as this would fuck up temperature smoothing)
-        # - potential problems with calculation of sum(heating) for day / week / month
-
-        return (df.groupby(["device_id", pd.Grouper(key="date", freq=freq, label="right", closed="right")], as_index=False)
-                .agg(**aggs)
-                .merge(df[["device_id", "date"] + copy_columns], on=["device_id", "date"])
-                .assign(temperature=lambda x: x.temperature.round(2),
-                        heating_demand_percentage=lambda x: x.heating_demand_percentage.round()))
-
     df = convert_measures_to_df()
     df = add_time_grid(df)
     df = df.sort_values(["device_id", "date"])
     df = fill_gaps(df)
-    df = add_heating_stats(df)
-    df = resample(df, resample_freq)
+    df = add_heating_stats(df, get_heater_id(devices))
+    df = resample_heating_data(df, resample_freq)
 
     device_names = {_id: d.name for _id, d in devices.items()}
     return df.assign(device_name=lambda x: x.device_id.map(device_names))
