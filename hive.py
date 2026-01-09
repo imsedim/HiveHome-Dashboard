@@ -204,25 +204,24 @@ def add_heating_stats(df: pd.DataFrame, heater_id: str) -> pd.DataFrame:
                         heating_length=heating_groups.heating_minutes.transform('sum').where(df.heating_relay, None),
                         heating_load_length=heating_groups.heating_load_minutes.transform('sum').where(df.heating_relay, None))
 
-def resample_heating_data(df: pd.DataFrame, freq: str = "5min"):
+
+def resample_heating_data(df: pd.DataFrame, freq: str = "5min") -> pd.DataFrame:
+    """Resample heating data to specified frequency."""
     if freq is None:
         return df
 
     aggs = ({x: (x, "sum") for x in ["heating_minutes", "heating_load_minutes"]} |
-            {"t_low": (["temperature", "t_low"]["t_low" in df], "min"), 
-            "t_high": (["temperature", "t_high"]["t_high" in df], "max")})
-    copy_columns = ["heat_target", "heating_demand", "heating_relay", "is_heater",
-                    "heating_start", "heating_length", "heating_load_length", 
+            {"heating_relay": ("heating_relay", "max"),
+            "heating_start": ("heating_start", "first"),
+            "heating_length": ("heating_length", "first"),
+             "t_low": (["temperature", "t_low"]["t_low" in df], "min"),
+             "t_high": (["temperature", "t_high"]["t_high" in df], "max")})
+    copy_columns = ["heat_target", "heating_demand", "is_heater",
+                    "heating_load_length",
                     "temperature", "heating_demand_percentage"]
 
-    # heating_relay looks into the future, so is heating_minutes derived from it
-    # bug: heating_minutes after resampling look both in future and past - need to rethink label and closed
-    # problems: 
-    # - mismatch between heating_length and sum(heating_minutes) - 23/10 Living room (also 24/10 Living room, 23/10 Bedroom)
-    #   - can change frequency to 1 min (bad idea as this would fuck up temperature smoothing)
-    # - potential problems with calculation of sum(heating) for day / week / month
-
-    return (df.groupby(["device_id", pd.Grouper(key="date", freq=freq, label="right", closed="right")], as_index=False)
+    
+    return (df.groupby(["device_id", pd.Grouper(key="date", freq=freq, label="left", closed="left")], as_index=False)
             .agg(**aggs)
             .merge(df[["device_id", "date"] + copy_columns], on=["device_id", "date"])
             .assign(temperature=lambda x: x.temperature.round(2),
