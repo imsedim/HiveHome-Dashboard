@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md / CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to AI Agents (such as Claude Code) when working with code in this repository.
 
 ## Project Overview
 
@@ -65,6 +65,8 @@ pip install -r requirements.dev.txt
 ## Important Details
 
 - Time is UTC internally, converted to Europe/London for display
-- Device ID mapping is hardcoded in `hive.py` around line 198
 - Heating segments break at midnight for daily metrics
 - Uses quadratic interpolation for temperature, forward-fill for relay states
+
+## Testing instructions
+- Add or update tests for the code you change, even if nobody asked.

@@ -3,3 +3,7 @@
 data/credentials.json
 **/venv
 .DS_Store
+
+# CLAUDE.md files (automatically generated from AGENTS.md via symlinks)
+CLAUDE.md
+**/CLAUDE.md
