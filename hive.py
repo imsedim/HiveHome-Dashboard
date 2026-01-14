@@ -188,21 +188,25 @@ async def fetch_device_data(device: str, start_time: datetime, end_time: datetim
             raise
 
 def add_heating_stats(df: pd.DataFrame, heater_id: str) -> pd.DataFrame:
-    df = (df.assign(is_heater=lambda x: x.device_id == heater_id,
+    """
+    Calculate heating statistics for each row.
+
+    heating_minutes is forward-looking: value at timestamp T represents
+    heating from T until the next timestamp.
+    """
+    df = df.assign(is_heater=lambda x: x.device_id == heater_id,
                     heating_relay=lambda x: x.heating_relay.where(x.is_heater, x.heating_relay & x.heating_demand.fillna(False)),
                     next_date=lambda x: x.groupby("device_id").date.shift(-1).fillna(x.date),
-                    heating_minutes=lambda x: (x.next_date - x.date).dt.total_seconds().div(60).where(x.heating_relay, None),
-                    heating_load_minutes=lambda x: x.heating_minutes.mul(x.heating_demand_percentage).div(100))
-            .drop(columns=["next_date"]))
+                    heating_minutes=lambda x: (x.next_date - x.date).dt.total_seconds().div(60).where(x.heating_relay, None))
 
     heating_groups = (df.assign(heating_relay=lambda x: x.heating_relay.astype(float))
-                        .pipe(lambda x: x.groupby(["device_id",
-                                                    x.date.dt.tz_convert('Europe/London').dt.floor('D'),
-                                                    (x.heating_relay != x.groupby("device_id").heating_relay.shift()).cumsum()])))
-
-    return df.assign(heating_start=heating_groups.date.transform('first').where(df.heating_relay, None),
-                        heating_length=heating_groups.heating_minutes.transform('sum').where(df.heating_relay, None),
-                        heating_load_length=heating_groups.heating_load_minutes.transform('sum').where(df.heating_relay, None))
+                      .pipe(lambda x: x.groupby(["device_id",
+                                                 x.date.dt.tz_convert('Europe/London').dt.floor('D'),
+                                                 (x.heating_relay != x.groupby("device_id").heating_relay.shift()).cumsum()])))
+    return (df.assign(heating_start=heating_groups.date.transform('first').where(df.heating_relay, None),
+                     heating_end=heating_groups.next_date.transform('last').where(df.heating_relay, None),
+                     heating_length=heating_groups.heating_minutes.transform('sum').where(df.heating_relay, None))
+            .drop(columns=["next_date"]))
 
 
 def resample_heating_data(df: pd.DataFrame, freq: str = "5min") -> pd.DataFrame:
@@ -210,14 +214,14 @@ def resample_heating_data(df: pd.DataFrame, freq: str = "5min") -> pd.DataFrame:
     if freq is None:
         return df
 
-    aggs = ({x: (x, "sum") for x in ["heating_minutes", "heating_load_minutes"]} |
-            {"heating_relay": ("heating_relay", "max"),
-            "heating_start": ("heating_start", "first"),
-            "heating_length": ("heating_length", "first"),
+    aggs = ({"heating_minutes": ("heating_minutes", "sum"),
+             "heating_relay": ("heating_relay", "max"),
+             "heating_start": ("heating_start", "first"),
+             "heating_end": ("heating_end", "first"),
+             "heating_length": ("heating_length", "first"),
              "t_low": (["temperature", "t_low"]["t_low" in df], "min"),
              "t_high": (["temperature", "t_high"]["t_high" in df], "max")})
     copy_columns = ["heat_target", "heating_demand", "is_heater",
-                    "heating_load_length",
                     "temperature", "heating_demand_percentage"]
 
     
@@ -346,6 +350,31 @@ async def get_current_device_data() -> dict[str, dict]:
             for k, v in product_state.items()}
 
 
+def _load_cached_dataframe() -> pd.DataFrame:
+    """Load cached DataFrame from pickle file. Returns empty DataFrame if no cache exists."""
+    return pd.read_pickle(CACHED_DEVICE_DATA_FILE) if CACHED_DEVICE_DATA_FILE.exists() else pd.DataFrame()
+
+
+def _save_cached_dataframe(df: pd.DataFrame) -> None:
+    """Save DataFrame to pickle cache file."""
+    df.to_pickle(CACHED_DEVICE_DATA_FILE)
+
+
+def _save_raw_data(filename: str, data: dict) -> None:
+    """Save raw API response to JSON file in data/raw/ directory."""
+    (RAW_DEVICE_DATA_DIR / filename).write_text(json.dumps(data))
+
+
+async def _fetch_all_device_data(devices: dict[str, Device], start: datetime, end: datetime) -> dict:
+    """Fetch measurement data for all devices in parallel. Returns dict of device_id -> data."""
+    async with asyncio.TaskGroup() as tg:
+    #   current_task = tg.create_task(get_current_device_data())
+        tasks = [tg.create_task(fetch_device_data(device_id, start, end))
+                 for device_id, device in devices.items()
+                 if device.is_heater or device.is_trv]
+    return dict([t.result() for t in tasks if t.result()])
+
+
 @timeit
 async def get_device_data(refresh: bool = False) -> pd.DataFrame:
     """
@@ -354,7 +383,7 @@ async def get_device_data(refresh: bool = False) -> pd.DataFrame:
     Incrementally fetches only data newer than last full day in cache.
     """
 
-    history_data: pd.DataFrame = pd.read_pickle(CACHED_DEVICE_DATA_FILE) if CACHED_DEVICE_DATA_FILE.exists() else pd.DataFrame()
+    history_data = _load_cached_dataframe()
     if not refresh:
         return history_data if not history_data.empty else None
 
@@ -376,13 +405,7 @@ async def get_device_data(refresh: bool = False) -> pd.DataFrame:
     batch_end = datetime.now(UTC_TZ)
     with time_it("Requesting data"):
         print(f"Fetching data from {batch_start:%Y-%m-%d} to {batch_end:%Y-%m-%d %H:%M:%S}")
-        async with asyncio.TaskGroup() as tg:
-            # current_task = tg.create_task(get_current_device_data())
-            devices_tasks = [tg.create_task(fetch_device_data(device_id, batch_start, batch_end))
-                             for device_id, device in devices.items()
-                             if device.is_heater or device.is_trv]
-
-    device_data_dict = dict([t.result() for t in devices_tasks if t.result()])
+        device_data_dict = await _fetch_all_device_data(devices, batch_start, batch_end)
 
     last_reportings = {device_id: datetime.fromtimestamp(max(int(next(reversed(device_data[m]))) for m in MEASURE_NAMES if m in device_data), tz=UTC_TZ)
         for device_id, device_data in device_data_dict.items()}
@@ -396,25 +419,15 @@ async def get_device_data(refresh: bool = False) -> pd.DataFrame:
     # if full day's worth of data is fetched since last.
     if history_data.empty or (new_cutoff_date > cutoff_date):
         print(f"New data cutoff: {new_cutoff_date: %Y-%m-%d}")
-        (RAW_DEVICE_DATA_DIR / f"{new_cutoff_date:%Y-%m-%d}.json").write_text(json.dumps(device_data_dict))
-
-    # update_device_data_with_current_state(last_reportings, device_data_dict, current_task.result())
+        _save_raw_data(f"{new_cutoff_date:%Y-%m-%d}.json", device_data_dict)
 
     device_data = _create_device_dataframe(devices, device_data_dict)
     if not history_data.empty:
         device_data = pd.concat([history_data.query("date < @cutoff_date"),
                                  device_data.query("date >= @cutoff_date")], ignore_index=True)
 
-    device_data.to_pickle(CACHED_DEVICE_DATA_FILE)
+    _save_cached_dataframe(device_data)
     return device_data
-
-
-def update_device_data_with_current_state(last_reportings: dict[str, datetime], data: dict, current_device_state: dict):
-    now = datetime.now(UTC_TZ)
-    for device_id, device_data in data.items():
-        if last_reportings[device_id] <= now - timedelta(minutes=1):
-            for measure, value in current_device_state.get(device_id, {}).items():
-                device_data[measure][str(int(now.timestamp()))] = int(value)
 
 
 async def call_api_async(url: str, method: str = "get", params: dict | None = None) -> dict:

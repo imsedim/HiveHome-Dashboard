@@ -1,2 +1,4 @@
 ipykernels
 watchdog
+pytest
+pytest-asyncio
