@@ -231,45 +231,52 @@ def resample_heating_data(df: pd.DataFrame, freq: str = "5min") -> pd.DataFrame:
             .assign(temperature=lambda x: x.temperature.round(2),
                     heating_demand_percentage=lambda x: x.heating_demand_percentage.round()))
 
+def _convert_measures_to_df(devices: dict[str, Device], data: dict) -> pd.DataFrame:
+    """
+    Convert raw API measurements dict to a merged DataFrame with all measures.
+
+    Merges TRV measures with resampled heating_relay from heater device.
+    Uses hardcoded device_mapping for legacy device ID remapping.
+    """
+    def create_measure_df(values: dict, measure: str, device_id: str) -> pd.DataFrame:
+        return (pd.DataFrame(values.items(), columns=["date", "value"])
+                .assign(measure=measure, device_id=device_id,
+                        date=lambda x: pd.to_datetime(x.date.astype(int), unit='s', utc=True).dt.floor('min')))
+
+    heater_id = get_heater_id(devices)
+    heating_df = (create_measure_df(data[heater_id]["heating_relay"], None, None)
+                  .rename(columns={"value": "heating_relay"})
+                  .loc[:, ["date", "heating_relay"]]
+                  .set_index("date")
+                  .sort_index()
+                  .resample("1min")
+                  .ffill()
+                  .reset_index())
+
+    device_mapping = {"65e0f239-21d7-4bac-a96f-96bc3520b682": "c31bc5f9-5962-4636-ba0f-c43406c2d029"}
+    measures_df = (pd.concat((pd.concat(create_measure_df(mv, m, device_id)
+                                        for m, mv in device_data.items()
+                                        if mv and m in MEASURE_NAMES)
+                              for _d, device_data in data.items()
+                              for device_id in [device_mapping.get(_d, _d)]), ignore_index=True)
+                   .pivot_table(index=["date", "device_id"], columns="measure", values="value")
+                   .reset_index())
+
+    return (measures_df
+            .drop(columns="heating_relay")
+            .merge(heating_df, on="date", how="outer")
+            .assign(heating_demand=lambda x: x.heating_demand if "heating_demand" in x else None,
+                    heat_target=lambda x: x.heat_target if "heat_target" in x else None)
+            .assign(heating_relay=lambda x: x.heating_relay.astype('boolean'),
+                    heating_demand=lambda x: x.heating_demand.astype('boolean')))
+
+
 def _create_device_dataframe(devices: dict[str, Device], data: dict, resample_freq: str = "5min") -> pd.DataFrame:
     """
     Transform raw API measurements into processed DataFrame.
     Applies time grid alignment, gap interpolation, and heating stats calculation.
     Uses hardcoded device_mapping for legacy device ID remapping.
     """
-
-    def convert_measures_to_df() -> pd.DataFrame:
-        def create_measure_df(values: dict, measure: str, device_id: str) -> pd.DataFrame:
-            return (pd.DataFrame(values.items(), columns=["date", "value"])
-                    .assign(measure=measure, device_id=device_id,
-                            date=lambda x: pd.to_datetime(x.date.astype(int), unit='s', utc=True).dt.floor('min')))
-
-        heater_id = get_heater_id(devices)
-        heating_df = (create_measure_df(data[heater_id]["heating_relay"], None, None)
-                      .rename(columns={"value": "heating_relay"})
-                      .loc[:, ["date", "heating_relay"]]
-                      .set_index("date")
-                      .sort_index()
-                      .resample("1min")
-                      .ffill()
-                      .reset_index())
-
-        device_mapping = {"65e0f239-21d7-4bac-a96f-96bc3520b682": "c31bc5f9-5962-4636-ba0f-c43406c2d029"}
-        measures_df = (pd.concat((pd.concat(create_measure_df(mv, m, device_id)
-                                            for m, mv in device_data.items()
-                                            if mv and m in MEASURE_NAMES)
-                                  for _d, device_data in data.items()
-                                  for device_id in [device_mapping.get(_d, _d)]), ignore_index=True)
-                       .pivot_table(index=["date", "device_id"], columns="measure", values="value")
-                       .reset_index())
-
-        return (measures_df
-                .drop(columns="heating_relay")
-                .merge(heating_df, on="date", how="outer")
-                .assign(heating_demand=lambda x: x.heating_demand if "heating_demand" in x else None,
-                        heat_target=lambda x: x.heat_target if "heat_target" in x else None)
-                .assign(heating_relay=lambda x: x.heating_relay.astype('boolean'),
-                        heating_demand=lambda x: x.heating_demand.astype('boolean')))
 
     def add_time_grid(df: pd.DataFrame, freq: str = "5min") -> pd.DataFrame:
         date_index = (df.assign(day=lambda x: df.date.dt.normalize())
@@ -300,7 +307,7 @@ def _create_device_dataframe(devices: dict[str, Device], data: dict, resample_fr
 
         return df.reset_index()
 
-    df = convert_measures_to_df()
+    df = _convert_measures_to_df(devices, data)
     df = add_time_grid(df)
     df = df.sort_values(["device_id", "date"])
     df = fill_gaps(df)

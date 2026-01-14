@@ -1,8 +1,12 @@
 import pytest
 import pandas as pd
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-from hive import _create_device_dataframe
+from hive import _create_device_dataframe, _convert_measures_to_df, Device
 from tests.conftest import HEATER_ID, TRV_ID
+
+UTC_TZ = ZoneInfo("UTC")
 
 
 class TestCreateDeviceDataframe:
@@ -77,3 +81,74 @@ class TestCreateDeviceDataframe:
 
         # Resampled should have fewer or equal rows
         assert len(df_resampled) <= len(df_raw)
+
+
+class TestConvertMeasuresToDf:
+    """Tests for _convert_measures_to_df function."""
+
+    @staticmethod
+    def ts(minute: int) -> str:
+        """Create unix timestamp string for 2024-01-01 10:XX:00 UTC."""
+        return str(int(datetime(2024, 1, 1, 10, minute, 0, tzinfo=UTC_TZ).timestamp()))
+
+    def test_trv_gets_heater_timestamps_via_outer_merge(self):
+        """
+        Bug reproduction: When heater has timestamps that TRV doesn't have,
+        the outer merge should propagate those timestamps to the TRV.
+        Currently, device_id is NaN for heater-only timestamps causing them
+        to be lost.
+
+        Setup:
+        - TRV has data at 10:00, 10:05, 10:10
+        - Heater has data at 10:03, 10:05, 10:07 (10:05 is shared)
+
+        Expected: TRV should have at least the union: 10:00, 10:03, 10:05, 10:07, 10:10
+        Bug: TRV only has 10:00, 10:05, 10:10 (heater-only timestamps 10:03, 10:07 lost)
+        """
+        heater_id = "test_heater"
+        trv_id = "test_trv"
+
+        devices = {
+            heater_id: Device(id=heater_id, name="Boiler", type="boilermodule"),
+            trv_id: Device(id=trv_id, name="Living Room", type="trv"),
+        }
+
+        data = {
+            heater_id: {
+                "heating_relay": {
+                    self.ts(3): 1,   # 10:03 - heater only
+                    self.ts(5): 1,   # 10:05 - shared with TRV
+                    self.ts(7): 1,   # 10:07 - heater only
+                },
+            },
+            trv_id: {
+                "temperature": {
+                    self.ts(0): 20.0,   # 10:00 - TRV only
+                    self.ts(5): 20.5,   # 10:05 - shared with heater
+                    self.ts(10): 21.0,  # 10:10 - TRV only
+                },
+                "heat_target": {
+                    self.ts(0): 22.0,
+                    self.ts(5): 22.0,
+                    self.ts(10): 22.0,
+                },
+                "heating_relay": {
+                    self.ts(0): 1,
+                    self.ts(5): 1,
+                    self.ts(10): 1,
+                },
+            },
+        }
+
+        result = _convert_measures_to_df(devices, data)
+        trv_rows = result[result.device_id == trv_id]
+
+        trv_timestamps = set(trv_rows.date.dt.minute.tolist())
+
+        # Union of TRV (10:00, 10:05, 10:10) and heater (10:03, 10:05, 10:07) original timestamps
+        expected_min_timestamps = {0, 3, 5, 7, 10}
+
+        assert expected_min_timestamps.issubset(trv_timestamps), (
+            f"TRV should have at least timestamps {expected_min_timestamps} but got {trv_timestamps}. "
+            f"Heater-only timestamps (10:03, 10:07) were not propagated to TRV due to NaN device_id in outer merge."
+        )
