@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, date, timezone
 import inspect
 import time
 from typing import Any
+import pandas as pd
 import streamlit as st
 
 DATE_TYPE_DAY, DATE_TYPE_MONTH, DATE_TYPE_YEAR, DATE_TYPE_WEEK = 0, 1, 2, 3
@@ -64,6 +65,12 @@ def _last(date_type: str) -> date:
 def make_utc(dt: date) -> datetime:
     timestamp = time.mktime(dt.timetuple())
     return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+
+
+def format_duration(minutes: pd.Series) -> pd.Series:
+    mm = minutes.dropna().astype(int)
+    result = (mm % 60).astype(str) + "m"
+    return result.where(mm < 60, (mm // 60).astype(str) + "h " + result)
 
 
 class Colors:

@@ -2,7 +2,7 @@ import asyncio
 from decimal import Decimal
 import random
 from cognito import BotoSession
-from utils import DATE_TYPE_DAY, render_date_title, timeit, write_date_picker, write_span
+from utils import DATE_TYPE_DAY, format_duration, render_date_title, timeit, write_date_picker, write_span
 import streamlit as st
 import hive
 import pandas as pd
@@ -63,19 +63,16 @@ async def get_data(period: tuple, refresh: bool = False) -> pd.DataFrame:
 
         devices = await hive.get_devices()
         device_names = {device_id: device.name for device_id, device in devices.items()}
-        heating_duration_str = ((heating_duration_mm := data.heating_length.dropna().astype(int)) % 60).astype(str) + "m"
-        heating_duration_str = heating_duration_str.where(heating_duration_mm < 60, (heating_duration_mm // 60).astype(str) + "h " + heating_duration_str)
-        top_mins_str = ((top_mins := data.top_device_minutes.dropna().astype(int)) % 60).astype(str) + "m"
-        top_mins_str = top_mins_str.where(top_mins < 60, (top_mins // 60).astype(str) + "h " + top_mins_str)
-        data = data.assign(heating_length_str=lambda x: heating_duration_str.where(x.heating_relay, ""),
-                           top_device_minutes_str= lambda x: top_mins_str.where(x.top_device_minutes.notnull(), ""), 
-                           top_device=lambda x: (x.top_device_id.map(device_names) + " (" + x.top_device_share_pct.astype(str) + "%)").where(x.top_device_id.notna())
+        heater_top_device = (data.query("is_heater")
+                             .assign(top_device=lambda x: (x.top_device_id.map(device_names) + " (" + x.top_device_share_pct.astype(str) + "% :: " + format_duration(x.top_device_minutes)+")").where(x.top_device_id.notna()))
+                             .set_index('date')["top_device"])
+        data = data.assign(heating_length_str=lambda x: format_duration(x.heating_length).where(x.heating_relay, ""),
+                           top_device=lambda x: x.date.map(heater_top_device)
                     ).drop(columns=["top_device_id", "top_device_share_pct", "top_device_minutes", "heating_end"])
 
-
         # workaround for empty tooltips in heating relay chart
-        data[["heating_start", "heating_length_str", "top_device", "top_device_minutes_str"]] = (
-            data.groupby("device_id")[["heating_start", "heating_length_str", "top_device", "top_device_minutes_str"]].ffill(1))
+        data[["heating_start", "heating_length_str", "top_device"]] = (
+            data.groupby("device_id")[["heating_start", "heating_length_str", "top_device"]].ffill(1))
         # print(data.columns)   
         cache[None] = data
 
@@ -307,8 +304,7 @@ def get_daily_chart_spec(device_colours: dict[str, str], device: hive.Device | N
                                     "scale": {"zero": False, "domain": [0, 20]}, "axis": None},
                                     "tooltip": [{"field": "heating_start", "type": "temporal", "timeUnit": "hoursminutes", "title": "start"},
                                                 {"field": "heating_length_str", "title": "length"},
-                                                {"field": "top_device", "title": "top device"},
-                                                {"field": "top_device_minutes_str", "title": " active"}],
+                                                {"field": "top_device", "title": "top device"}],
                                     "color": {"value": "red"}}}],
             "encoding": {"x": {"field": "date", "type": "temporal", "binned": True,  "title": "time",
                                "axis": {"ticks": True, "grid": True, "gridOpacity": 0.35, "format": "%H:%M"}},
