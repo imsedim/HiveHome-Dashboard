@@ -8,15 +8,23 @@ Heat is a Streamlit dashboard for monitoring and analyzing Hive Home smart heati
 
 ## Commands
 
+**Always activate the virtual environment before running any Python commands:**
+
 ```bash
+# Activate venv (required before any python/pip/pytest commands)
+source venv/bin/activate
+
 # Run the application
 streamlit run app.py
 
 # Install dependencies
-pip3 install -r requirements.txt
+pip install -r requirements.txt
 
 # Install dev dependencies (Jupyter, watchdog)
 pip install -r requirements.dev.txt
+
+# Run tests
+pytest
 ```
 
 ## Architecture

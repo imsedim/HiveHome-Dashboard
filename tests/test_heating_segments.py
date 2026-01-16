@@ -350,3 +350,113 @@ class TestTopHeatingDevice:
         first_bin = boiler_resampled[boiler_resampled.date == pd.Timestamp("2024-01-01 10:00:00", tz=UTC_TZ)]
         assert first_bin.iloc[0]["top_device_id"] == "trv_a"
         assert first_bin.iloc[0]["top_device_minutes"] == 4.0
+
+
+class TestTopDeviceSharePct:
+    """Tests for top_device_share_pct calculation."""
+
+    def test_share_pct_two_trvs(self):
+        """Share percentage with two TRVs: 6 and 4 minutes -> top device = 60%."""
+        # Boiler ON for 10 minutes
+        # TRV_A: 6 minutes, TRV_B: 4 minutes
+        # Total TRV minutes = 10, top device share = 6/10 = 60%
+        df = create_multi_device_df(
+            datetime(2024, 1, 1, 10, 0, 0, tzinfo=UTC_TZ),
+            boiler_relay=[True] * 10 + [False],
+            trv_demands={
+                "trv_a": [True] * 6 + [False] * 5,
+                "trv_b": [True] * 4 + [False] * 7,
+            }
+        )
+        df = _add_heating_stats(df, heater_id="boiler")
+
+        boiler_rows = df[df.device_id == "boiler"]
+        heating_boiler = boiler_rows[boiler_rows.heating_relay]
+
+        assert heating_boiler.iloc[0]["top_device_id"] == "trv_a"
+        assert heating_boiler.iloc[0]["top_device_share_pct"] == 60
+
+    def test_share_pct_single_trv(self):
+        """Single TRV active -> share percentage = 100%."""
+        df = create_multi_device_df(
+            datetime(2024, 1, 1, 10, 0, 0, tzinfo=UTC_TZ),
+            boiler_relay=[True, True, True, True, False],
+            trv_demands={
+                "trv_a": [True, True, True, True, False],
+            }
+        )
+        df = _add_heating_stats(df, heater_id="boiler")
+
+        boiler_rows = df[df.device_id == "boiler"]
+        heating_boiler = boiler_rows[boiler_rows.heating_relay]
+
+        assert heating_boiler.iloc[0]["top_device_share_pct"] == 100
+
+    def test_share_pct_null_when_no_trvs(self):
+        """No TRVs active -> share percentage should be null."""
+        df = create_multi_device_df(
+            datetime(2024, 1, 1, 10, 0, 0, tzinfo=UTC_TZ),
+            boiler_relay=[True, True, True, False],
+            trv_demands={
+                "trv_a": [False, False, False, False],
+            }
+        )
+        df = _add_heating_stats(df, heater_id="boiler")
+
+        boiler_rows = df[df.device_id == "boiler"]
+        heating_boiler = boiler_rows[boiler_rows.heating_relay]
+
+        assert pd.isna(heating_boiler.iloc[0]["top_device_share_pct"])
+
+    def test_share_pct_rounded_to_integer(self):
+        """Share percentage is rounded to integer."""
+        # 3 and 2 minutes -> 3/5 = 60% (exactly)
+        # 5 and 3 minutes -> 5/8 = 62.5% -> rounds to 62%
+        df = create_multi_device_df(
+            datetime(2024, 1, 1, 10, 0, 0, tzinfo=UTC_TZ),
+            boiler_relay=[True] * 8 + [False],
+            trv_demands={
+                "trv_a": [True] * 5 + [False] * 4,
+                "trv_b": [True] * 3 + [False] * 6,
+            }
+        )
+        df = _add_heating_stats(df, heater_id="boiler")
+
+        boiler_rows = df[df.device_id == "boiler"]
+        heating_boiler = boiler_rows[boiler_rows.heating_relay]
+
+        # 5/8 = 62.5%, rounds to 62
+        assert heating_boiler.iloc[0]["top_device_share_pct"] == 62
+
+    def test_share_pct_preserved_after_resampling(self):
+        """top_device_share_pct is preserved after resampling."""
+        df = create_multi_device_df(
+            datetime(2024, 1, 1, 10, 0, 0, tzinfo=UTC_TZ),
+            boiler_relay=[True] * 6 + [False],
+            trv_demands={
+                "trv_a": [True] * 4 + [False] * 3,
+                "trv_b": [True] * 2 + [False] * 5,
+            }
+        )
+        df = _add_heating_stats(df, heater_id="boiler")
+        resampled = _resample_heating_data(df, freq="5min")
+
+        boiler_resampled = resampled[resampled.device_id == "boiler"]
+        first_bin = boiler_resampled[boiler_resampled.date == pd.Timestamp("2024-01-01 10:00:00", tz=UTC_TZ)]
+
+        # 4 / (4+2) = 4/6 = 66.67% -> rounds to 67%
+        assert first_bin.iloc[0]["top_device_share_pct"] == 67
+
+    def test_share_pct_trv_rows_null(self):
+        """TRV rows should have null top_device_share_pct."""
+        df = create_multi_device_df(
+            datetime(2024, 1, 1, 10, 0, 0, tzinfo=UTC_TZ),
+            boiler_relay=[True, True, True, False],
+            trv_demands={
+                "trv_a": [True, True, False, False],
+            }
+        )
+        df = _add_heating_stats(df, heater_id="boiler")
+
+        trv_rows = df[df.device_id == "trv_a"]
+        assert trv_rows["top_device_share_pct"].isna().all()

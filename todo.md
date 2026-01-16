@@ -1,4 +1,6 @@
 # Bugs
+- [x] fix heating_length calc bugs (forward-looking resampling and heating_relay propagation to trvs)
+- [x] test coverage
 - [x] Pandas gives errors on load
 - [x] Rework get_device_data() to use last actual datapoint for next batch (so, don't use last dataframe date since then measurements are skipped)
 - [x] merge_device_data updates period.to with latest measurement timestamp
@@ -22,6 +24,7 @@
 # Tasks
 - [ ] Rethink aggregate plots - what story does this visualisation tell? 
   - [ ] ??? For month / year / week - add granularity controls (by week/month)
+- [x] add top heating device stats
 - [x] high-level stats: % or Hours each TRV was active - vertical bar plot? 
 - [x] Highlight segments of device line where heating was demanded / received
 - [x] Make daily plot always show all devices (would be transparent if not selected)

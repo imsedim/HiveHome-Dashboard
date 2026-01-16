@@ -250,12 +250,15 @@ def _add_top_device_stats(df: pd.DataFrame) -> pd.DataFrame:
     trv_data = trv_data.assign(segment_idx=segment_indices).query('segment_idx >= 0')
 
     if trv_data.empty:
-        return df.assign(top_device_id=None, top_device_minutes=None)
+        return df.assign(top_device_id=None, top_device_minutes=None, top_device_share_pct=None)
 
     # Aggregate TRV minutes per (segment, device_id)
     trv_totals = (trv_data
                   .groupby(['segment_idx', 'device_id'], as_index=False)['heating_minutes']
                   .sum())
+
+    # Calculate total TRV minutes per segment for share calculation
+    segment_totals = trv_totals.groupby('segment_idx')['heating_minutes'].sum().rename('segment_total_minutes')
 
     # Find top device per segment (ties: first in device_id sort order)
     top_per_segment = (trv_totals
@@ -263,24 +266,25 @@ def _add_top_device_stats(df: pd.DataFrame) -> pd.DataFrame:
                                     ascending=[True, False, True])
                        .groupby('segment_idx', as_index=False)
                        .first()
+                       .merge(segment_totals, on='segment_idx')
+                       .assign(top_device_share_pct=lambda x: (x.heating_minutes / x.segment_total_minutes * 100).round().astype('Int64'))
+                       .drop(columns='segment_total_minutes')
                        .rename(columns={'device_id': 'top_device_id',
                                        'heating_minutes': 'top_device_minutes'}))
 
     # Map back to boiler_segments
-    boiler_segments = (boiler_segments.merge(top_per_segment[['segment_idx', 'top_device_id', 'top_device_minutes']],
+    boiler_segments = (boiler_segments.merge(top_per_segment[['segment_idx', 'top_device_id', 'top_device_minutes', 'top_device_share_pct']],
                                             left_index=True, right_on='segment_idx',how='left')
                                       .drop(columns='segment_idx'))
 
     # Merge to original dataframe (both boiler rows and trv rows get values)
-    df = df.merge(
-        boiler_segments[['heating_start', 'heating_end', 'top_device_id', 'top_device_minutes']],
-        on=['heating_start', 'heating_end'],
-        how='left'
-    )
+    df = df.merge(boiler_segments[['heating_start', 'heating_end', 'top_device_id', 'top_device_minutes', 'top_device_share_pct']],
+                  on=['heating_start', 'heating_end'], how='left')
 
-    # Ensure TRV rows have null values
-    df.loc[~df.is_heater, ['top_device_id', 'top_device_minutes']] = None
-
+    # Ensure TRV rows have null values, create top_device display string
+    df = df.assign(top_device_id=lambda x: x.top_device_id.where(x.is_heater, None),
+                   top_device_minutes=lambda x: x.top_device_minutes.where(x.is_heater, None),
+                   top_device_share_pct=lambda x: x.top_device_share_pct.where(x.is_heater, None))
     return df
 
 
@@ -289,15 +293,16 @@ def _resample_heating_data(df: pd.DataFrame, freq: str = "5min") -> pd.DataFrame
     if freq is None:
         return df
 
-    aggs = ({"heating_minutes": ("heating_minutes", "sum"),
-             "heating_relay": ("heating_relay", "max"),
-             "heating_start": ("heating_start", "first"),
-             "heating_end": ("heating_end", "first"),
-             "heating_length": ("heating_length", "first"),
-             "top_device_id": ("top_device_id", "first"),
-             "top_device_minutes": ("top_device_minutes", "first"),
-             "t_low": (["temperature", "t_low"]["t_low" in df], "min"),
-             "t_high": (["temperature", "t_high"]["t_high" in df], "max")})
+    aggs = {"heating_minutes": ("heating_minutes", "sum"),
+            "heating_relay": ("heating_relay", "max"),
+            "heating_start": ("heating_start", "first"),
+            "heating_end": ("heating_end", "first"),
+            "heating_length": ("heating_length", "first"),
+            "top_device_id": ("top_device_id", "first"),
+            "top_device_minutes": ("top_device_minutes", "first"),
+            "top_device_share_pct": ("top_device_share_pct", "first"),
+            "t_low": (["temperature", "t_low"]["t_low" in df], "min"),
+            "t_high": (["temperature", "t_high"]["t_high" in df], "max")}
     copy_columns = ["heat_target", "heating_demand", "is_heater",
                     "temperature", "heating_demand_percentage"]
 
@@ -400,15 +405,9 @@ def _create_device_dataframe(devices: dict[str, Device], data: dict, resample_fr
     df = fill_gaps(df)
     df = _add_heating_stats(df, get_heater_id(devices))
     df = _resample_heating_data(df, resample_freq)
-    return map_device_names(devices, df, "device_id", "top_device_id")
-
-def map_device_names(devices: dict[str, Device], df: pd.DataFrame, *column_names: str) -> pd.DataFrame:
-    """Map device IDs to names in specified column of DataFrame.
-       New column with _name suffix is created for each device_id column."""
+    
     device_names = {device_id: device.name for device_id, device in devices.items()}
-    mapping = {name.replace("_id", "_name"): lambda x, name=name: x[name].map(device_names)
-               for name in column_names}
-    return df.assign(**mapping) 
+    return df.assign(device_name = lambda x: x.device_id.map(device_names))
 
 async def get_product_state() -> dict[str, dict]:
     """Fetch live state of devices, keyed by device ID (not product ID)."""
