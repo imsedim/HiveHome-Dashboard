@@ -98,7 +98,7 @@ def start_authentication(username: str, password: str) -> AuthenticationResult:
     try:
         u.authenticate(password)
     except MFAChallengeException as mfa_challenge:
-        print(f" *** SMS MFA required")
+        print(" *** SMS MFA required")
         return AuthenticationResult(mfa_tokens=mfa_challenge.get_tokens(), mfa_username=u.mfa_username)
     else:
         return AuthenticationResult(id_token=u.id_token, access_token=u.access_token, refresh_token=u.refresh_token)
@@ -187,12 +187,15 @@ async def fetch_device_data(device: str, start_time: datetime, end_time: datetim
         if e.status != 404:
             raise
 
-def add_heating_stats(df: pd.DataFrame, heater_id: str) -> pd.DataFrame:
+def _add_heating_stats(df: pd.DataFrame, heater_id: str) -> pd.DataFrame:
     """
     Calculate heating statistics for each row.
 
     heating_minutes is forward-looking: value at timestamp T represents
     heating from T until the next timestamp.
+
+    For boiler rows, also computes top_device_id and top_device_minutes:
+    the TRV that was active longest during each boiler heating segment.
     """
     df = df.assign(is_heater=lambda x: x.device_id == heater_id,
                     heating_relay=lambda x: x.heating_relay.where(x.is_heater, x.heating_relay & x.heating_demand.fillna(False)),
@@ -203,13 +206,85 @@ def add_heating_stats(df: pd.DataFrame, heater_id: str) -> pd.DataFrame:
                       .pipe(lambda x: x.groupby(["device_id",
                                                  x.date.dt.tz_convert('Europe/London').dt.floor('D'),
                                                  (x.heating_relay != x.groupby("device_id").heating_relay.shift()).cumsum()])))
-    return (df.assign(heating_start=heating_groups.date.transform('first').where(df.heating_relay, None),
-                     heating_end=heating_groups.next_date.transform('last').where(df.heating_relay, None),
-                     heating_length=heating_groups.heating_minutes.transform('sum').where(df.heating_relay, None))
+    df = (df.assign(heating_start=heating_groups.date.transform('first').where(df.heating_relay, None),
+                   heating_end=heating_groups.next_date.transform('last').where(df.heating_relay, None),
+                   heating_length=heating_groups.heating_minutes.transform('sum').where(df.heating_relay, None))
             .drop(columns=["next_date"]))
 
+    df = _add_top_device_stats(df)
 
-def resample_heating_data(df: pd.DataFrame, freq: str = "5min") -> pd.DataFrame:
+    return df
+
+
+def _add_top_device_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each boiler heating segment, find the TRV that was active longest.
+    Adds top_device_id and top_device_minutes columns to boiler rows only.
+    """
+    # Get unique boiler heating segments
+    boiler_segments = (df.loc[df.is_heater & df.heating_relay, ['heating_start', 'heating_end']]
+                       .drop_duplicates()
+                       .dropna()
+                       .sort_values('heating_start')
+                       .reset_index(drop=True))
+
+    # if boiler_segments.empty:
+    #     return df.assign(top_device_id=None, top_device_minutes=None)
+
+    # Create interval index for efficient lookup: [start, end)
+    intervals = pd.IntervalIndex.from_arrays(
+        boiler_segments.heating_start,
+        boiler_segments.heating_end,
+        closed='left'
+    )
+
+    # Get TRV rows with heating activity
+    trv_mask = ~df.is_heater & df.heating_relay
+    trv_data = df.loc[trv_mask, ['device_id', 'date', 'heating_minutes']]
+
+    # if trv_data.empty:
+    #     return df.assign(top_device_id=None, top_device_minutes=None)
+
+    # Map each TRV timestamp to its containing boiler segment
+    segment_indices = intervals.get_indexer(trv_data.date)
+    trv_data = trv_data.assign(segment_idx=segment_indices).query('segment_idx >= 0')
+
+    if trv_data.empty:
+        return df.assign(top_device_id=None, top_device_minutes=None)
+
+    # Aggregate TRV minutes per (segment, device_id)
+    trv_totals = (trv_data
+                  .groupby(['segment_idx', 'device_id'], as_index=False)['heating_minutes']
+                  .sum())
+
+    # Find top device per segment (ties: first in device_id sort order)
+    top_per_segment = (trv_totals
+                       .sort_values(['segment_idx', 'heating_minutes', 'device_id'],
+                                    ascending=[True, False, True])
+                       .groupby('segment_idx', as_index=False)
+                       .first()
+                       .rename(columns={'device_id': 'top_device_id',
+                                       'heating_minutes': 'top_device_minutes'}))
+
+    # Map back to boiler_segments
+    boiler_segments = (boiler_segments.merge(top_per_segment[['segment_idx', 'top_device_id', 'top_device_minutes']],
+                                            left_index=True, right_on='segment_idx',how='left')
+                                      .drop(columns='segment_idx'))
+
+    # Merge to original dataframe (both boiler rows and trv rows get values)
+    df = df.merge(
+        boiler_segments[['heating_start', 'heating_end', 'top_device_id', 'top_device_minutes']],
+        on=['heating_start', 'heating_end'],
+        how='left'
+    )
+
+    # Ensure TRV rows have null values
+    df.loc[~df.is_heater, ['top_device_id', 'top_device_minutes']] = None
+
+    return df
+
+
+def _resample_heating_data(df: pd.DataFrame, freq: str = "5min") -> pd.DataFrame:
     """Resample heating data to specified frequency."""
     if freq is None:
         return df
@@ -219,6 +294,8 @@ def resample_heating_data(df: pd.DataFrame, freq: str = "5min") -> pd.DataFrame:
              "heating_start": ("heating_start", "first"),
              "heating_end": ("heating_end", "first"),
              "heating_length": ("heating_length", "first"),
+             "top_device_id": ("top_device_id", "first"),
+             "top_device_minutes": ("top_device_minutes", "first"),
              "t_low": (["temperature", "t_low"]["t_low" in df], "min"),
              "t_high": (["temperature", "t_high"]["t_high" in df], "max")})
     copy_columns = ["heat_target", "heating_demand", "is_heater",
@@ -243,16 +320,6 @@ def _convert_measures_to_df(devices: dict[str, Device], data: dict) -> pd.DataFr
                 .assign(measure=measure, device_id=device_id,
                         date=lambda x: pd.to_datetime(x.date.astype(int), unit='s', utc=True).dt.floor('min')))
 
-    heater_id = get_heater_id(devices)
-    heating_df = (create_measure_df(data[heater_id]["heating_relay"], None, None)
-                  .rename(columns={"value": "heating_relay"})
-                  .loc[:, ["date", "heating_relay"]]
-                  .set_index("date")
-                  .sort_index()
-                  .resample("1min")
-                  .ffill()
-                  .reset_index())
-
     device_mapping = {"65e0f239-21d7-4bac-a96f-96bc3520b682": "c31bc5f9-5962-4636-ba0f-c43406c2d029"}
     measures_df = (pd.concat((pd.concat(create_measure_df(mv, m, device_id)
                                         for m, mv in device_data.items()
@@ -261,10 +328,30 @@ def _convert_measures_to_df(devices: dict[str, Device], data: dict) -> pd.DataFr
                               for device_id in [device_mapping.get(_d, _d)]), ignore_index=True)
                    .pivot_table(index=["date", "device_id"], columns="measure", values="value")
                    .reset_index())
+    
+
+    heater_rows = measures_df.device_id == get_heater_id(devices)
+    trv_devices = measures_df.loc[~heater_rows, ["device_id"]].drop_duplicates()
+
+    heating_df = measures_df.loc[heater_rows, ["date", "heating_relay"]]
+    heating_resampled_df = (heating_df.set_index("date")
+                            .sort_index()
+                            .resample("1min")
+                            .ffill()
+                            .reset_index())
+
+    measures_df = (measures_df
+                   .drop(columns="heating_relay")
+                   .merge(heating_resampled_df, on="date", how="left"))
+    
+    heating_trv_broadcast_df = heating_df.merge(trv_devices, how="cross")
+    missing_heating_df = (heating_trv_broadcast_df.merge(measures_df[['device_id', 'date']], on=['device_id', 'date'], how='left', indicator=True)
+                             .query('_merge == "left_only"')
+                             .drop(columns='_merge'))
+    
+    measures_df = pd.concat([measures_df, missing_heating_df], ignore_index=True)
 
     return (measures_df
-            .drop(columns="heating_relay")
-            .merge(heating_df, on="date", how="outer")
             .assign(heating_demand=lambda x: x.heating_demand if "heating_demand" in x else None,
                     heat_target=lambda x: x.heat_target if "heat_target" in x else None)
             .assign(heating_relay=lambda x: x.heating_relay.astype('boolean'),
@@ -311,12 +398,17 @@ def _create_device_dataframe(devices: dict[str, Device], data: dict, resample_fr
     df = add_time_grid(df)
     df = df.sort_values(["device_id", "date"])
     df = fill_gaps(df)
-    df = add_heating_stats(df, get_heater_id(devices))
-    df = resample_heating_data(df, resample_freq)
+    df = _add_heating_stats(df, get_heater_id(devices))
+    df = _resample_heating_data(df, resample_freq)
+    return map_device_names(devices, df, "device_id", "top_device_id")
 
-    device_names = {_id: d.name for _id, d in devices.items()}
-    return df.assign(device_name=lambda x: x.device_id.map(device_names))
-
+def map_device_names(devices: dict[str, Device], df: pd.DataFrame, *column_names: str) -> pd.DataFrame:
+    """Map device IDs to names in specified column of DataFrame.
+       New column with _name suffix is created for each device_id column."""
+    device_names = {device_id: device.name for device_id, device in devices.items()}
+    mapping = {name.replace("_id", "_name"): lambda x, name=name: x[name].map(device_names)
+               for name in column_names}
+    return df.assign(**mapping) 
 
 async def get_product_state() -> dict[str, dict]:
     """Fetch live state of devices, keyed by device ID (not product ID)."""

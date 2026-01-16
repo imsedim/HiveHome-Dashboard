@@ -152,3 +152,52 @@ class TestConvertMeasuresToDf:
             f"TRV should have at least timestamps {expected_min_timestamps} but got {trv_timestamps}. "
             f"Heater-only timestamps (10:03, 10:07) were not propagated to TRV due to NaN device_id in outer merge."
         )
+
+    def test_heating_relay_values_come_from_heater(self):
+        """
+        Verify that heating_relay column values in the result come from the heater device.
+        - When heater has a timestamp: use heater's heating_relay value
+        - When heater doesn't have a timestamp: heating_relay should be NULL
+        """
+        heater_id = "test_heater"
+        trv_id = "test_trv"
+
+        devices = {
+            heater_id: Device(id=heater_id, name="Boiler", type="boilermodule"),
+            trv_id: Device(id=trv_id, name="Living Room", type="trv"),
+        }
+
+        data = {
+            heater_id: {
+                "heating_relay": {
+                    self.ts(0): 1,   # Heater ON at 10:00
+                    self.ts(5): 0,   # Heater OFF at 10:05
+                    # No heater data at 10:10
+                },
+            },
+            trv_id: {
+                "temperature": {
+                    self.ts(0): 20.0,
+                    self.ts(5): 20.5,
+                    self.ts(10): 21.0,  # TRV has data at 10:10, heater doesn't
+                },
+                "heat_target": {
+                    self.ts(0): 22.0,
+                    self.ts(5): 22.0,
+                    self.ts(10): 22.0,
+                },
+                "heating_relay": {
+                    self.ts(0): 0,   # TRV value (should be ignored, use heater's 1)
+                    self.ts(5): 1,   # TRV value (should be ignored, use heater's 0)
+                    self.ts(10): 1,  # TRV value (should be ignored, heater has no data -> NULL)
+                },
+            },
+        }
+
+        result = _convert_measures_to_df(devices, data)
+        trv_rows = result[result.device_id == trv_id].sort_values("date").reset_index(drop=True)
+
+        # heating_relay should come from heater, not TRV
+        assert trv_rows.loc[0, "heating_relay"] == True, "10:00 should be ON (from heater)"
+        assert trv_rows.loc[1, "heating_relay"] == False, "10:05 should be OFF (from heater)"
+        assert pd.isna(trv_rows.loc[2, "heating_relay"]), "10:10 should be NULL (heater has no data)"
